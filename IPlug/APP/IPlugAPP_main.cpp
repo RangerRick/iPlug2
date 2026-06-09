@@ -530,8 +530,6 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
 #include "swell-internal.h"
 #include <alsa/asoundlib.h>
 
-#define WM_USER_OPENWINDOW (WM_USER + 1)
-
 HWND gHWND;
 HINSTANCE gHINSTANCE;
 

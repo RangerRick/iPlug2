@@ -53,14 +53,17 @@
   #define DEFAULT_OUTPUT_DEV "Default Device"
 #elif defined(OS_MAC)
   #include "IPlugSWELL.h"
-  #define SLEEP( milliseconds ) usleep( (unsigned long) (milliseconds * 1000.0) )
   #define DEFAULT_INPUT_DEV "Built-in Input"
   #define DEFAULT_OUTPUT_DEV "Built-in Output"
 #elif defined(OS_LINUX)
   #include "IPlugSWELL.h"
-  #define SLEEP(milliseconds) usleep((unsigned long)(milliseconds * 1000.0))
   #define DEFAULT_INPUT_DEV "default"
   #define DEFAULT_OUTPUT_DEV "default"
+  #define WM_USER_OPENWINDOW (WM_USER + 1)
+#endif
+
+#if defined(OS_MAC) || defined(OS_LINUX)
+  #define SLEEP(milliseconds) usleep((unsigned long)(milliseconds * 1000.0))
 #endif
 
 #include "RtAudio.h"

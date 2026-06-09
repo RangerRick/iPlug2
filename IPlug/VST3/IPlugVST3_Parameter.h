@@ -49,7 +49,11 @@ public:
   void toString(Steinberg::Vst::ParamValue valueNormalized, Steinberg::Vst::String128 string) const override
   {
     WDL_String display;
-    mIPlugParam->GetDisplay(valueNormalized, true, display);
+    bool isDoubleType = mIPlugParam->Type() == IParam::kTypeDouble;
+    double value = mIPlugParam->FromNormalized(valueNormalized);
+    if (!isDoubleType)
+      value = std::round(mIPlugParam->Constrain(value));
+    mIPlugParam->GetDisplay(value, false, display);
     Steinberg::UString(string, 128).fromAscii(display.Get());
   }
 

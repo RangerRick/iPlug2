@@ -38,7 +38,7 @@ using namespace igraphics;
 
 #define IDT_SCREENSHOT_TIMER 1001
 #ifdef OS_LINUX
-#define WM_USER_OPENWINDOW (WM_USER + 1)
+#define IDT_OPENWINDOW_TIMER 1002
 static bool sPlugWindowOpen = false; // guards WM_SIZE before plugin window is ready
 #endif
 
@@ -91,7 +91,6 @@ void IPlugAPPHost::PopulateAudioInputList(HWND hwndDlg, RtAudio::DeviceInfo* inf
     SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_ADDSTRING,0,(LPARAM)buf.Get());
   }
 
-  // TEMP
   buf.SetFormatted(20, "%i", i+1);
   SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_ADDSTRING,0,(LPARAM)buf.Get());
 
@@ -115,7 +114,6 @@ void IPlugAPPHost::PopulateAudioOutputList(HWND hwndDlg, RtAudio::DeviceInfo* in
     SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_ADDSTRING,0,(LPARAM)buf.Get());
   }
 
-  // TEMP
   buf.SetFormatted(20, "%i", i+1);
   SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_ADDSTRING,0,(LPARAM)buf.Get());
 
@@ -193,16 +191,7 @@ void IPlugAPPHost::PopulateAudioDialogs(HWND hwndDlg)
 {
   PopulateDriverSpecificControls(hwndDlg);
 
-//  if (mState.mAudioInIsMono)
-//  {
-//    SendDlgItemMessage(hwndDlg,IDC_CB_MONO_INPUT,BM_SETCHECK, BST_CHECKED,0);
-//  }
-//  else
-//  {
-//    SendDlgItemMessage(hwndDlg,IDC_CB_MONO_INPUT,BM_SETCHECK, BST_UNCHECKED,0);
-//  }
-
-//  Populate buffer size combobox
+  // Populate buffer size combobox
   for (int i = 0; i< kNumBufferSizeOptions; i++)
   {
     SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_BUF_SIZE,CB_ADDSTRING,0,(LPARAM)kBufferSizeOptions[i].c_str());
@@ -291,7 +280,6 @@ void IPlugAPPHost::PopulatePreferencesDialog(HWND hwndDlg)
 void IPlugAPPHost::PopulatePreferencesDialog(HWND hwndDlg)
 {
   SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_DRIVER,CB_ADDSTRING,0,(LPARAM)"CoreAudio");
-  //SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_DRIVER,CB_ADDSTRING,0,(LPARAM)"Jack");
   SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_DRIVER,CB_SETCURSEL, mState.mAudioDriverType, 0);
 
   PopulateAudioDialogs(hwndDlg);
@@ -427,16 +415,14 @@ WDL_DLGRET IPlugAPPHost::PreferencesDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wPar
           {
             mState.mAudioInChanL = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_IN_L, CB_GETCURSEL, 0, 0) + 1;
 
-            //TEMP
             mState.mAudioInChanR = mState.mAudioInChanL + 1;
             SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_SETCURSEL, mState.mAudioInChanR - 1, 0);
-            //
           }
           break;
 
         case IDC_COMBO_AUDIO_IN_R:
           if (HIWORD(wParam) == CBN_SELCHANGE)
-            SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_SETCURSEL, mState.mAudioInChanR - 1, 0);  // TEMP
+            SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_SETCURSEL, mState.mAudioInChanR - 1, 0);
                 mState.mAudioInChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_IN_R, CB_GETCURSEL, 0, 0);
           break;
 
@@ -445,25 +431,16 @@ WDL_DLGRET IPlugAPPHost::PreferencesDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wPar
           {
             mState.mAudioOutChanL = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_OUT_L, CB_GETCURSEL, 0, 0) + 1;
 
-            //TEMP
             mState.mAudioOutChanR = mState.mAudioOutChanL + 1;
             SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_SETCURSEL, mState.mAudioOutChanR - 1, 0);
-            //
           }
           break;
 
         case IDC_COMBO_AUDIO_OUT_R:
           if (HIWORD(wParam) == CBN_SELCHANGE)
-            SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_SETCURSEL, mState.mAudioOutChanR - 1, 0);  // TEMP
+            SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_SETCURSEL, mState.mAudioOutChanR - 1, 0);
                 mState.mAudioOutChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_OUT_R, CB_GETCURSEL, 0, 0);
           break;
-
-//        case IDC_CB_MONO_INPUT:
-//          if (SendDlgItemMessage(hwndDlg,IDC_CB_MONO_INPUT, BM_GETCHECK, 0, 0) == BST_CHECKED)
-//            mState.mAudioInIsMono = 1;
-//          else
-//            mState.mAudioInIsMono = 0;
-//          break;
 
         case IDC_COMBO_AUDIO_BUF_SIZE: // follow through
           if (HIWORD(wParam) == CBN_SELCHANGE)
@@ -566,7 +543,6 @@ static void ClientResize(HWND hWnd, int width, int height)
   SetWindowPos(hWnd, 0, x, y, width + ptDiff.x, height + ptDiff.y, 0);
 }
 
-//static
 WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
   IPlugAPPHost* pAppHost = IPlugAPPHost::sInstance.get();
@@ -614,16 +590,16 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
       // Posted from main() after SetMenu. Use a short timer to let the
       // GDK event loop process the SetMenu resize before we size and
       // open the plugin window.
-      SetTimer(hwndDlg, 0xF00D, 50, nullptr);
+      SetTimer(hwndDlg, IDT_OPENWINDOW_TIMER, 50, nullptr);
       return 0;
     }
 #endif
     case WM_TIMER:
     {
 #ifdef OS_LINUX
-      if (wParam == 0xF00D)
+      if (wParam == IDT_OPENWINDOW_TIMER)
       {
-        KillTimer(hwndDlg, 0xF00D);
+        KillTimer(hwndDlg, IDT_OPENWINDOW_TIMER);
         IPlugAPP* pPlug2 = pAppHost->GetPlug();
         ClientResize(hwndDlg, pPlug2->GetEditorWidth(),
                      pPlug2->GetEditorHeight());
