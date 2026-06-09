@@ -422,8 +422,10 @@ WDL_DLGRET IPlugAPPHost::PreferencesDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wPar
 
         case IDC_COMBO_AUDIO_IN_R:
           if (HIWORD(wParam) == CBN_SELCHANGE)
+          {
+            mState.mAudioInChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_IN_R, CB_GETCURSEL, 0, 0) + 1;
             SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_IN_R,CB_SETCURSEL, mState.mAudioInChanR - 1, 0);
-                mState.mAudioInChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_IN_R, CB_GETCURSEL, 0, 0);
+          }
           break;
 
         case IDC_COMBO_AUDIO_OUT_L:
@@ -438,8 +440,10 @@ WDL_DLGRET IPlugAPPHost::PreferencesDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wPar
 
         case IDC_COMBO_AUDIO_OUT_R:
           if (HIWORD(wParam) == CBN_SELCHANGE)
+          {
+            mState.mAudioOutChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_OUT_R, CB_GETCURSEL, 0, 0) + 1;
             SendDlgItemMessage(hwndDlg,IDC_COMBO_AUDIO_OUT_R,CB_SETCURSEL, mState.mAudioOutChanR - 1, 0);
-                mState.mAudioOutChanR = (int) SendDlgItemMessage(hwndDlg, IDC_COMBO_AUDIO_OUT_R, CB_GETCURSEL, 0, 0);
+          }
           break;
 
         case IDC_COMBO_AUDIO_BUF_SIZE: // follow through
@@ -601,6 +605,8 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
       {
         KillTimer(hwndDlg, IDT_OPENWINDOW_TIMER);
         IPlugAPP* pPlug2 = pAppHost->GetPlug();
+        if (!pPlug2)
+          return 0;
         ClientResize(hwndDlg, pPlug2->GetEditorWidth(),
                      pPlug2->GetEditorHeight());
         if (!pAppHost->OpenWindow(gHWND))

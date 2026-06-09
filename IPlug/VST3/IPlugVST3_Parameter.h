@@ -51,6 +51,11 @@ public:
     WDL_String display;
     bool isDoubleType = mIPlugParam->Type() == IParam::kTypeDouble;
     double value = mIPlugParam->FromNormalized(valueNormalized);
+    if (!std::isfinite(value))
+    {
+      Steinberg::UString(string, 128).fromAscii("");
+      return;
+    }
     if (!isDoubleType)
       value = std::round(mIPlugParam->Constrain(value));
     mIPlugParam->GetDisplay(value, false, display);
