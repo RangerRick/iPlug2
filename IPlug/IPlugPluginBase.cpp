@@ -843,10 +843,13 @@ bool IPluginBase::LoadPresetFromFXP(const char* file)
       rewind(fp);
       
       pgm.Resize((int) fileSize);
-      fread(pgm.GetData(), fileSize, 1, fp);
-      
+      const bool readOK = fread(pgm.GetData(), fileSize, 1, fp) == 1;
+
       fclose(fp);
-      
+
+      if (!readOK)
+        return false;
+
       int pos = 0;
       
       int32_t chunkMagic;
@@ -934,10 +937,13 @@ bool IPluginBase::LoadBankFromFXB(const char* file)
       rewind(fp);
       
       bnk.Resize((int) fileSize);
-      fread(bnk.GetData(), fileSize, 1, fp);
-      
+      const bool readOK = fread(bnk.GetData(), fileSize, 1, fp) == 1;
+
       fclose(fp);
-      
+
+      if (!readOK)
+        return false;
+
       int pos = 0;
       
       int32_t chunkMagic;
