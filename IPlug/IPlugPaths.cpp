@@ -312,6 +312,9 @@ EResourceLocation LocateResource(const char* name, const char* type, WDL_String&
 
   // Compose <fmt> with the given args, stat it, and on success store it in result.
   // Collapses six near-identical stat-and-return blocks into one. (#73)
+  // Note: routing through this lambda drops SetFormatted's printf format-attribute
+  // checking (fmt is no longer a literal at the call). Every call site below passes
+  // a string literal with only const char* args, so this is safe.
   auto tryPath = [&](const char* fmt, auto... args) -> bool {
     candidate.SetFormatted(PATH_MAX, fmt, args...);
     if (stat(candidate.Get(), &st) == 0)
