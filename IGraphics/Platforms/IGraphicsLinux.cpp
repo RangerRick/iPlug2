@@ -11,10 +11,12 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <mutex>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cerrno>
 #include <dlfcn.h>
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
@@ -366,6 +368,48 @@ static void GtkPresentDialog(GTK3* g, void* dialog)
     g->window_set_modal(dialog, 1);
   if (g->window_present)
     g->window_present(dialog);
+}
+
+// Present a modal dialog, run it, hand the response to onResponse (while the
+// dialog is still alive so the caller can extract its result), then destroy the
+// dialog and drain pending events. Collapses the present/run/destroy/drain
+// sequence repeated at every dialog site into one place. (#73)
+template <typename OnResponse>
+static int RunGtkDialog(GTK3* g, void* dialog, OnResponse&& onResponse)
+{
+  GtkPresentDialog(g, dialog);
+  const int resp = g->dialog_run(dialog);
+  onResponse(resp);
+  g->widget_destroy(dialog);
+  GtkDrainEvents(g);
+  return resp;
+}
+
+// Launch a detached external process. Double-forks so the grandchild is
+// reparented to init and the intermediate child is reaped here — neither
+// becomes a zombie. Returns true if the launch was initiated. (#48)
+// ponytail: double-fork over signal(SIGCHLD, SIG_IGN), which is process-wide
+// and would clobber the host's child-reaping in a loaded plugin.
+static bool LaunchDetached(const char* program, const char* arg)
+{
+  pid_t pid = fork();
+  if (pid == 0)
+  {
+    pid_t grandchild = fork();
+    if (grandchild == 0)
+    {
+      execlp(program, program, arg, (char*)nullptr);
+      _exit(127);
+    }
+    _exit(grandchild > 0 ? 0 : 1);
+  }
+  if (pid > 0)
+  {
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {} // reap intermediate child (returns promptly)
+    return true;
+  }
+  return false;
 }
 
 // ---- Runtime fontconfig (optional — loaded via dlopen so plugins work without it) ----
@@ -844,11 +888,8 @@ EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* title,
   void* dialog = g->message_dialog_new(nullptr, 0, gtkMsgType, gtkBtnType, "%s", str);
   if (title && g->window_set_title)
     g->window_set_title(dialog, title);
-  GtkPresentDialog(g, dialog);
 
-  int resp = g->dialog_run(dialog);
-  g->widget_destroy(dialog);
-  GtkDrainEvents(g);
+  const int resp = RunGtkDialog(g, dialog, [](int) {}); // result derived from resp below
 
   EMsgBoxResult result = kOK;
   switch (resp)
@@ -871,18 +912,13 @@ bool IGraphicsLinux::RevealPathInExplorerOrFinder(WDL_String& path, bool select)
   WDL_String dir(path);
   if (select)
   {
-    char* lastSlash = strrchr(dir.Get(), '/');
-    if (lastSlash)
-      *lastSlash = '\0';
+    // Truncate to the parent dir via WDL_String, not by writing '\0' through
+    // Get() — that desyncs the cached length and is UB on the const buffer. (#60)
+    if (strrchr(dir.Get(), '/'))
+      dir.remove_filepart(false);
   }
 
-  pid_t pid = fork();
-  if (pid == 0)
-  {
-    execlp("xdg-open", "xdg-open", dir.Get(), nullptr);
-    _exit(127);
-  }
-  return pid > 0;
+  return LaunchDetached("xdg-open", dir.Get());
 }
 
 void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
@@ -931,11 +967,11 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
   // For save dialogs, suggest filename
   if (isSave && fileName.GetLength() && g->file_chooser_set_current_name)
     g->file_chooser_set_current_name(dialog, fileName.Get());
-  GtkPresentDialog(g, dialog);
 
   WDL_String outFile, outPath;
-  if (g->dialog_run(dialog) == kGTK_RESPONSE_OK)
-  {
+  RunGtkDialog(g, dialog, [&](int resp) {
+    if (resp != kGTK_RESPONSE_OK)
+      return;
     char* chosen = g->file_chooser_get_filename(dialog);
     if (chosen)
     {
@@ -945,10 +981,7 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
         outPath.Set(chosen, (int)(slash - chosen + 1));
       free(chosen);
     }
-  }
-
-  g->widget_destroy(dialog);
-  GtkDrainEvents(g);
+  });
 
   if (completionHandler)
     completionHandler(outFile, outPath);
@@ -974,21 +1007,18 @@ void IGraphicsLinux::PromptForDirectory(WDL_String& dir,
 
   if (dir.GetLength() && g->file_chooser_set_current_folder)
     g->file_chooser_set_current_folder(dialog, dir.Get());
-  GtkPresentDialog(g, dialog);
 
   WDL_String outDir;
-  if (g->dialog_run(dialog) == kGTK_RESPONSE_OK)
-  {
+  RunGtkDialog(g, dialog, [&](int resp) {
+    if (resp != kGTK_RESPONSE_OK)
+      return;
     char* chosen = g->file_chooser_get_filename(dialog);
     if (chosen)
     {
       outDir.Set(chosen);
       free(chosen);
     }
-  }
-
-  g->widget_destroy(dialog);
-  GtkDrainEvents(g);
+  });
 
   if (completionHandler)
     completionHandler(outDir, WDL_String{});
@@ -1009,12 +1039,11 @@ bool IGraphicsLinux::PromptForColor(IColor& color, const char* str,
                      color.B / 255.0, color.A / 255.0 };
     g->color_chooser_set_rgba(dialog, &rgba);
   }
-  GtkPresentDialog(g, dialog);
-
-  const bool accepted = (g->dialog_run(dialog) == kGTK_RESPONSE_OK);
-
-  if (accepted && g->color_chooser_get_rgba)
-  {
+  bool accepted = false;
+  RunGtkDialog(g, dialog, [&](int resp) {
+    accepted = (resp == kGTK_RESPONSE_OK);
+    if (!accepted || !g->color_chooser_get_rgba)
+      return;
     GdkRGBA rgba = {};
     g->color_chooser_get_rgba(dialog, &rgba);
     color.R = (int)(rgba.red   * 255.0 + 0.5);
@@ -1023,22 +1052,13 @@ bool IGraphicsLinux::PromptForColor(IColor& color, const char* str,
     color.A = (int)(rgba.alpha * 255.0 + 0.5);
     if (func)
       func(color);
-  }
-
-  g->widget_destroy(dialog);
-  GtkDrainEvents(g);
+  });
   return accepted;
 }
 
 bool IGraphicsLinux::OpenURL(const char* url, const char* msgWindowTitle, const char* confirmMsg, const char* errMsgOnFailure)
 {
-  pid_t pid = fork();
-  if (pid == 0)
-  {
-    execlp("xdg-open", "xdg-open", url, nullptr);
-    _exit(127);
-  }
-  return pid > 0;
+  return LaunchDetached("xdg-open", url);
 }
 
 bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
