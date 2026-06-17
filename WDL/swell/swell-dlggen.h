@@ -112,9 +112,11 @@ struct SWELL_DlgResourceEntry
 #define SWELL_DLG_WS_NOAUTOSIZE 8
 #define SWELL_DLG_WS_OPAQUE 16
 #define SWELL_DLG_WS_DROPTARGET 32
-#ifdef SWELL_TARGET_OSX
+// Defined unconditionally: SWELL_DEFINE_DIALOG_RESOURCE_BEGIN below references
+// this flag on every platform (via `& ~SWELL_DLG_WS_DEFAULT_SCALING`), so gating
+// the define to OSX left it undefined on -generic and broke the Linux build.
+// On -generic it is an inert bit (fixed dialog scaling is used instead).
 #define SWELL_DLG_WS_DEFAULT_SCALING 128
-#endif
      
 typedef struct SWELL_DialogResourceIndex
 {
