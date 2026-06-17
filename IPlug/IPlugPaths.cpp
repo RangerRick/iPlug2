@@ -251,12 +251,12 @@ void AppSupportPath(WDL_String& path, bool isSystem)
   else
   {
     const char* xdgConfig = getenv("XDG_CONFIG_HOME");
-    if (xdgConfig && xdgConfig[0])
+    if (IsSafeAbsoluteDir(xdgConfig))
       path.Set(xdgConfig);
     else
     {
       const char* home = getenv("HOME");
-      if (!home || !home[0]) return;
+      if (!IsSafeAbsoluteDir(home)) return;
       path.SetFormatted(PATH_MAX, "%s/.config", home);
     }
   }
@@ -265,7 +265,7 @@ void AppSupportPath(WDL_String& path, bool isSystem)
 void DesktopPath(WDL_String& path)
 {
   const char* home = getenv("HOME");
-  if (!home || !home[0]) return;
+  if (!IsSafeAbsoluteDir(home)) return;
   path.SetFormatted(PATH_MAX, "%s/Desktop", home);
 }
 
@@ -276,10 +276,15 @@ void VST3PresetsPath(WDL_String& path, const char* mfrName, const char* pluginNa
   else
   {
     const char* home = getenv("HOME");
-    if (!home || !home[0]) return;
+    if (!IsSafeAbsoluteDir(home)) return;
     path.SetFormatted(PATH_MAX, "%s/.vst3/presets/%s/%s", home, mfrName, pluginName);
   }
 }
+
+// dladdr only needs an address inside this shared object to resolve the module
+// path; a dedicated file-scope anchor is more robust than &LocateResource, which
+// the compiler may inline or clone, moving the address out of this TU. (#60)
+static void IPlugPathsDladdrAnchor() {}
 
 EResourceLocation LocateResource(const char* name, const char* type, WDL_String& result,
                                   const char*, void*, const char* sharedResourcesSubPath)
@@ -298,49 +303,50 @@ EResourceLocation LocateResource(const char* name, const char* type, WDL_String&
   const char* fileNameOnly = strrchr(name, '/');
   fileNameOnly = fileNameOnly ? fileNameOnly + 1 : name;
 
+  // Reject traversal: fileNameOnly is composed into trusted base dirs below, so a
+  // "." or ".." basename would escape the resource directory. (#55, CWE-22)
+  if (!strcmp(fileNameOnly, ".") || !strcmp(fileNameOnly, ".."))
+    return EResourceLocation::kNotFound;
+
   WDL_String candidate;
+
+  // Compose <fmt> with the given args, stat it, and on success store it in result.
+  // Collapses six near-identical stat-and-return blocks into one. (#73)
+  auto tryPath = [&](const char* fmt, auto... args) -> bool {
+    candidate.SetFormatted(PATH_MAX, fmt, args...);
+    if (stat(candidate.Get(), &st) == 0)
+    {
+      result.Set(candidate.Get());
+      return true;
+    }
+    return false;
+  };
 
   // Use dladdr to find the directory of this plugin's own shared library (or executable).
   // This correctly handles VST3/CLAP plugins loaded into a host — /proc/self/exe would
   // give the host's path, not the plugin's.
   Dl_info dlInfo = {};
-  if (dladdr((void*)LocateResource, &dlInfo) && dlInfo.dli_fname)
+  if (dladdr((void*)&IPlugPathsDladdrAnchor, &dlInfo) && dlInfo.dli_fname)
   {
     WDL_String soDir;
     soDir.Set(dlInfo.dli_fname);
     soDir.remove_filepart(true); // keep trailing slash
 
-    // Try <so_dir>/resources/<type>/<filename>  (APP, flat CLAP layout)
-    candidate.SetFormatted(PATH_MAX, "%sresources/%s/%s", soDir.Get(), type, fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    // <so_dir>/resources/<type>/<filename>  (APP, flat CLAP layout)
+    if (tryPath("%sresources/%s/%s", soDir.Get(), type, fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
 
-    // Try <so_dir>/../Resources/<type>/<filename>  (VST3 bundle: Contents/arch-linux/ -> Contents/Resources/)
-    candidate.SetFormatted(PATH_MAX, "%s../Resources/%s/%s", soDir.Get(), type, fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    // <so_dir>/../Resources/<type>/<filename>  (VST3 bundle: Contents/arch-linux/ -> Contents/Resources/)
+    if (tryPath("%s../Resources/%s/%s", soDir.Get(), type, fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
 
-    // Try <so_dir>/../Resources/<filename>
-    candidate.SetFormatted(PATH_MAX, "%s../Resources/%s", soDir.Get(), fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    // <so_dir>/../Resources/<filename>
+    if (tryPath("%s../Resources/%s", soDir.Get(), fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
 
-    // Try <so_dir>/resources/<filename>
-    candidate.SetFormatted(PATH_MAX, "%sresources/%s", soDir.Get(), fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    // <so_dir>/resources/<filename>
+    if (tryPath("%sresources/%s", soDir.Get(), fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
   }
 
   // Fallback: look next to the host executable (covers cases where dladdr is unavailable)
@@ -353,19 +359,11 @@ EResourceLocation LocateResource(const char* name, const char* type, WDL_String&
     exePath.Set(buf);
     exePath.remove_filepart(true);
 
-    candidate.SetFormatted(PATH_MAX, "%sresources/%s/%s", exePath.Get(), type, fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    if (tryPath("%sresources/%s/%s", exePath.Get(), type, fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
 
-    candidate.SetFormatted(PATH_MAX, "%sresources/%s", exePath.Get(), fileNameOnly);
-    if (stat(candidate.Get(), &st) == 0)
-    {
-      result.Set(candidate.Get());
+    if (tryPath("%sresources/%s", exePath.Get(), fileNameOnly))
       return EResourceLocation::kAbsolutePath;
-    }
   }
 
   // Try path as-is relative to cwd

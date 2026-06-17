@@ -21,6 +21,7 @@
 #endif
 
 #include "IPlugLogger.h"
+#include "IPlugPaths.h" // IsSafeAbsoluteDir
 
 using namespace iplug;
 
@@ -140,11 +141,12 @@ bool IPlugAPPHost::InitState()
     return false;
   mINIPath.SetFormatted(MAX_PATH_LEN, "%s/Library/Application Support/%s/", home, BUNDLE_NAME);
 #elif defined OS_LINUX
+  // Validate env-provided dirs (absolute, no "..") before composing paths. (#55, CWE-22)
   const char* xdgConfig = getenv("XDG_CONFIG_HOME");
   const char* home = getenv("HOME");
-  if (xdgConfig && xdgConfig[0])
+  if (IsSafeAbsoluteDir(xdgConfig))
     mINIPath.SetFormatted(MAX_PATH_LEN, "%s/%s/", xdgConfig, BUNDLE_NAME);
-  else if (home && home[0])
+  else if (IsSafeAbsoluteDir(home))
     mINIPath.SetFormatted(MAX_PATH_LEN, "%s/.config/%s/", home, BUNDLE_NAME);
   else
     return false;
