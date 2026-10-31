@@ -871,10 +871,14 @@ jobs:
   # Linux - Ninja Generator (Default)
   # ============================================================================
   linux-ninja:
-    name: Linux (Ninja)
+    name: Linux (Ninja, ${{ matrix.os }})
     needs: parse-commands
     if: needs.parse-commands.outputs.should_run == 'true'
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -959,7 +963,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-ninja-artifacts
+          name: linux-ninja-artifacts-${{ matrix.os }}
           path: build/linux-ninja/out/
           if-no-files-found: warn
 
