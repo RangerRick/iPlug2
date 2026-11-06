@@ -144,13 +144,33 @@ void Timer_impl::TimerProc(void* userData)
   itimer->mTimerFunc(*itimer);
 }
 #elif defined OS_LINUX
-#include <unistd.h>
 #include <cstdio>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
+// The worker retains this state even if its callback destroys the Timer itself.
+struct Timer_impl::State
+{
+  State(Timer_impl* owner, ITimerFunction func, uint32_t intervalMs)
+  : mOwner(owner), mCallback(std::move(func)), mIntervalMs(intervalMs) {}
+
+  Timer_impl* mOwner;
+  ITimerFunction mCallback;
+  uint32_t mIntervalMs;
+  std::mutex mMutex;
+  std::condition_variable mWake;
+  pthread_t mThread = 0;
+  bool mStarted = false;
+  bool mRunning = true;
+  bool mJoining = false;
+  bool mJoined = false;
+};
 
 Timer* Timer::Create(ITimerFunction func, uint32_t intervalMs)
 {
-  auto* pTimer = new Timer_impl(func, intervalMs);
-  if (!pTimer->mThread)
+  auto* pTimer = new Timer_impl(std::move(func), intervalMs);
+  if (!pTimer->Start())
   {
     delete pTimer;
     return nullptr;
@@ -159,44 +179,74 @@ Timer* Timer::Create(ITimerFunction func, uint32_t intervalMs)
 }
 
 Timer_impl::Timer_impl(ITimerFunction func, uint32_t intervalMs)
-: mTimerFunc(func)
-, mIntervalMs(intervalMs)
+: mState(std::make_shared<State>(this, std::move(func), intervalMs))
+{}
+
+bool Timer_impl::Start()
 {
-  mRunning = true;
-  const int error = pthread_create(&mThread, nullptr, ThreadProc, this);
+  auto state = mState;
+  auto* workerState = new std::shared_ptr<State>(state);
+  // Publish the thread handle before the worker can invoke a callback.
+  std::lock_guard<std::mutex> lock(state->mMutex);
+  const int error = pthread_create(&state->mThread, nullptr, ThreadProc, workerState);
   if (error)
   {
-    mRunning = false;
-    mThread = 0;
+    delete workerState;
+    state->mRunning = false;
     fprintf(stderr, "Could not start Linux timer: %s\n", strerror(error));
   }
+  else
+    state->mStarted = true;
+  // Do not access the Timer after releasing the lock: a zero-interval callback
+  // may destroy it before Create() returns.
+  return state->mStarted;
 }
 
 Timer_impl::~Timer_impl()
 {
   Stop();
+  std::lock_guard<std::mutex> lock(mState->mMutex);
+  // External Stop() joins the worker. Self-destruction must let it finish on its own.
+  if (mState->mStarted && !mState->mJoining && !mState->mJoined &&
+      pthread_equal(mState->mThread, pthread_self()))
+    pthread_detach(mState->mThread);
 }
 
 void Timer_impl::Stop()
 {
-  // compare_exchange makes the check-then-act atomic so concurrent Stop()
-  // calls (e.g. destructor racing an explicit Stop) cannot double-join.
-  bool expected = true;
-  if (mRunning.compare_exchange_strong(expected, false))
+  auto state = mState;
+  std::unique_lock<std::mutex> lock(state->mMutex);
+  state->mRunning = false;
+  state->mWake.notify_all();
+  if (!state->mStarted || state->mJoined || pthread_equal(state->mThread, pthread_self()))
+    return;
+  if (state->mJoining)
   {
-    pthread_join(mThread, nullptr);
-    mThread = 0;
+    state->mWake.wait(lock, [&] { return state->mJoined; });
+    return;
   }
+  state->mJoining = true;
+  lock.unlock();
+  pthread_join(state->mThread, nullptr);
+  lock.lock();
+  state->mJoined = true;
+  state->mWake.notify_all();
 }
 
 void* Timer_impl::ThreadProc(void* pParam)
 {
-  Timer_impl* pTimer = reinterpret_cast<Timer_impl*>(pParam);
-  while (pTimer->mRunning)
+  auto* workerState = static_cast<std::shared_ptr<State>*>(pParam);
+  auto state = std::move(*workerState);
+  delete workerState;
+  std::unique_lock<std::mutex> lock(state->mMutex);
+  while (state->mRunning)
   {
-    usleep((unsigned long)(pTimer->mIntervalMs) * 1000UL);
-    if (pTimer->mRunning)
-      pTimer->mTimerFunc(*pTimer);
+    if (state->mWake.wait_for(lock, std::chrono::milliseconds(state->mIntervalMs),
+                             [&] { return !state->mRunning; }))
+      break;
+    lock.unlock();
+    state->mCallback(*state->mOwner);
+    lock.lock();
   }
   return nullptr;
 }

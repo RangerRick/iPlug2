@@ -19,6 +19,14 @@ target_link_libraries(LinuxRuntimeTest PRIVATE iPlug2::IGraphics::NanoVG::GL3)
 target_compile_definitions(LinuxRuntimeTest PRIVATE IPLUG_EDITOR=1 IPLUG_DSP=0)
 set_target_properties(LinuxRuntimeTest PROPERTIES ENABLE_EXPORTS ON)
 
+add_executable(LinuxTimerTest ../TimerTest.cpp "${IPLUG2_DIR}/IPlug/IPlugTimer.cpp")
+target_include_directories(LinuxTimerTest PRIVATE "${IPLUG2_DIR}/IPlug" "${IPLUG2_DIR}/WDL")
+target_compile_options(LinuxTimerTest PRIVATE -fsigned-char -include stdlib.h)
+target_link_libraries(LinuxTimerTest PRIVATE pthread)
+add_dependencies(LinuxRuntimeTest LinuxTimerTest)
+add_test(NAME linux-timer-lifecycle COMMAND LinuxTimerTest)
+set_tests_properties(linux-timer-lifecycle PROPERTIES TIMEOUT 15)
+
 foreach(mode close glx-context scaled-keys keyboard keyboard-no-im keyboard-no-im-c parent-validation
   native-close host-native-close clipboard clipboard-instances clipboard-fail
   clipboard-disappearing clipboard-host-handler core-timer core-timer-early core-timer-fail)
