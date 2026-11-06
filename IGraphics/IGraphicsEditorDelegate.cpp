@@ -117,8 +117,12 @@ void IGEditorDelegate::OnParentWindowResize(int width, int height)
   IPLUG_GFX_LOCK;
   if (auto* pGraphics = GetUI())
   {
+#ifdef OS_LINUX
+    static_cast<IGraphicsLinux*>(pGraphics)->ResizeFromHost(width, height);
+#else
     const auto scale = pGraphics->GetPlatformWindowScale();
     pGraphics->Resize(static_cast<int>(width / scale), static_cast<int>(height / scale), 1.0f, false);
+#endif
   }
 }
 

@@ -1873,7 +1873,13 @@ private:
   bool mResizingInProcess = false;
   bool mLayoutOnResize = false;
   bool mEnableMultiTouch = false;
+  // Native Linux host windows resize the layout unless a mode is explicitly
+  // selected with AttachCornerResizer(), including for docked REAPER editors.
+#ifdef OS_LINUX
+  EUIResizerMode mGUISizeMode = EUIResizerMode::Size;
+#else
   EUIResizerMode mGUISizeMode = EUIResizerMode::Scale;
+#endif
   double mPrevTimestamp = 0.;
   IKeyHandlerFunc mKeyHandlerFunc = nullptr;
   IDisplayTickFunc mDisplayTickFunc = nullptr;

@@ -33,6 +33,20 @@ static unsigned sErrorHandlerChanges = 0;
 static const char* sInputCommit = nullptr;
 static int sInputCommitStatus = XLookupChars;
 static unsigned sInputLookups = 0;
+static bool sSynchronousResize = false;
+
+extern "C" int XResizeWindow(Display* display, Window window, unsigned width, unsigned height)
+{
+  static auto resize = reinterpret_cast<decltype(&XResizeWindow)>(dlsym(RTLD_NEXT, "XResizeWindow"));
+  if (!resize)
+    abort();
+  const int result = resize(display, window, width, height);
+  // Keep the two independent test connections in order, so a host resize cannot
+  // overtake an older editor request that is still buffered by Xlib.
+  if (sSynchronousResize)
+    XSync(display, 0);
+  return result;
+}
 
 extern "C" XIM XOpenIM(Display* display, XrmDatabase database, char* name, char* className)
 {
@@ -547,6 +561,76 @@ static void CheckText(const std::string& actual, const char* expected, const cha
   }
 }
 
+static void TestResize()
+{
+  struct SynchronousResize
+  {
+    SynchronousResize() { sSynchronousResize = true; }
+    ~SynchronousResize() { sSynchronousResize = false; }
+  } synchronousResize;
+  TestDelegate delegate(true);
+  if (!delegate.OpenWindow(nullptr))
+  {
+    Check(false, "open editor for host resizing");
+    return;
+  }
+  auto& graphics = *static_cast<IGraphicsLinux*>(delegate.GetUI());
+  Display* host = XOpenDisplay(nullptr);
+  Check(host != nullptr, "open resizing host connection");
+  if (!host)
+    return;
+  const Window window = reinterpret_cast<uintptr_t>(graphics.GetWindow());
+  delegate.OnParentWindowResize(400, 300);
+  Check(graphics.Width() == 400 && graphics.Height() == 300 && graphics.GetDrawScale() == 1.f,
+        "editors without an explicit resize mode keep following the host layout");
+  auto nativeResize = [&](int width, int height) {
+    XResizeWindow(host, window, width, height);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+  };
+  for (float screenScale : {1.f, 2.f, 1.5f})
+  {
+    graphics.AttachCornerResizer(EUIResizerMode::Scale, false);
+    graphics.Resize(320, 240, 1.f);
+    graphics.SetScreenScale(screenScale);
+    for (int iteration = 0; iteration < 3; ++iteration)
+    {
+      delegate.OnParentWindowResize(static_cast<int>(480 * screenScale),
+                                    static_cast<int>(360 * screenScale));
+      Check(graphics.Width() == 320 && graphics.Height() == 240 &&
+            graphics.GetDrawScale() == 1.5f, "host resizing scales the fixed design bounds");
+      graphics.ProcessX11Events();
+      nativeResize(static_cast<int>(640 * screenScale), static_cast<int>(480 * screenScale));
+      Check(graphics.Width() == 320 && graphics.Height() == 240 &&
+            graphics.GetDrawScale() == 2.f, "X11 resizing shares the host's scale calculation without drift");
+      nativeResize(static_cast<int>(240 * screenScale), static_cast<int>(180 * screenScale));
+      Check(graphics.Width() == 320 && graphics.Height() == 240 &&
+            graphics.GetDrawScale() == .75f, "X11 shrinking preserves design bounds");
+    }
+    graphics.SetScaleConstraints(.75f, 2.f);
+    delegate.OnParentWindowResize(static_cast<int>(160 * screenScale), static_cast<int>(120 * screenScale));
+    Check(graphics.GetDrawScale() == .75f, "host resize respects minimum drawing scale");
+    delegate.OnParentWindowResize(static_cast<int>(960 * screenScale), static_cast<int>(720 * screenScale));
+    Check(graphics.GetDrawScale() == 2.f, "host resize respects maximum drawing scale");
+    delegate.SetSizeConstraints(240, 640, 180, 480);
+    delegate.OnParentWindowResize(static_cast<int>(1000 * screenScale), static_cast<int>(750 * screenScale));
+    Check(graphics.GetDrawScale() == 2.f, "host resize respects editor size constraints at HiDPI");
+    delegate.SetSizeConstraints(10, 100000, 10, 100000);
+    graphics.SetScaleConstraints(.5f, 4.f);
+
+    graphics.AttachCornerResizer(EUIResizerMode::Size, false);
+    graphics.Resize(320, 240, 1.25f);
+    delegate.OnParentWindowResize(static_cast<int>(500 * screenScale), static_cast<int>(375 * screenScale));
+    Check(graphics.Width() == 400 && graphics.Height() == 300 && graphics.GetDrawScale() == 1.25f,
+          "Size mode changes logical bounds while preserving the drawing scale");
+    graphics.ProcessX11Events();
+    nativeResize(static_cast<int>(750 * screenScale), static_cast<int>(500 * screenScale));
+    Check(graphics.Width() == 600 && graphics.Height() == 400 && graphics.GetDrawScale() == 1.25f,
+          "X11 Size mode accounts for both screen and drawing scale");
+  }
+  XCloseDisplay(host);
+}
+
 static void TestScaledKeys()
 {
   TestDelegate delegate(true);
@@ -881,6 +965,8 @@ int main(int argc, char** argv)
     TestGLXContext();
   else if (strcmp(argv[1], "scaled-keys") == 0)
     TestScaledKeys();
+  else if (strcmp(argv[1], "resize") == 0)
+    TestResize();
   else if (strcmp(argv[1], "keyboard") == 0 || strcmp(argv[1], "keyboard-no-im") == 0 ||
            strcmp(argv[1], "keyboard-no-im-c") == 0)
     TestKeyboard(strcmp(argv[1], "keyboard") != 0, strcmp(argv[1], "keyboard-no-im-c") != 0);

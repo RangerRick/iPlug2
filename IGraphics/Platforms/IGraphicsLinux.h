@@ -106,6 +106,8 @@ public:
 
   void PlatformResize(bool parentHasResized) override;
   void DrawResize() override;
+  /** Apply a host/X11 size in physical pixels, preserving the configured resize mode. */
+  void ResizeFromHost(int width, int height);
 
   void HideMouseCursor(bool hide, bool lock) override;
   void MoveMouseCursor(float x, float y) override;

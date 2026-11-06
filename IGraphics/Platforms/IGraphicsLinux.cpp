@@ -993,6 +993,28 @@ void IGraphicsLinux::DrawResize()
   IGRAPHICS_DRAW_CLASS::DrawResize();
 }
 
+void IGraphicsLinux::ResizeFromHost(int width, int height)
+{
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+  if (width <= 0 || height <= 0)
+    return;
+
+  int logicalWidth = static_cast<int>(std::lround(width / GetScreenScale()));
+  int logicalHeight = static_cast<int>(std::lround(height / GetScreenScale()));
+  GetDelegate()->ConstrainEditorResize(logicalWidth, logicalHeight);
+  if (GetResizerMode() == EUIResizerMode::Scale)
+  {
+    const float scale = std::min(static_cast<float>(logicalWidth) / Width(),
+                                 static_cast<float>(logicalHeight) / Height());
+    Resize(Width(), Height(), scale, false);
+  }
+  else
+  {
+    Resize(static_cast<int>(std::lround(logicalWidth / GetDrawScale())),
+           static_cast<int>(std::lround(logicalHeight / GetDrawScale())), GetDrawScale(), false);
+  }
+}
+
 void IGraphicsLinux::ForceEndUserEdit()
 {
 }
@@ -1982,8 +2004,6 @@ void IGraphicsLinux::DispatchX11Events()
   if (!mDisplay || !mPlugWnd || mCloseRequested)
     return;
 
-  const float scale = GetTotalScale();
-
   while (!mCloseRequested && XPending(mDisplay))
   {
     XEvent ev;
@@ -1991,6 +2011,7 @@ void IGraphicsLinux::DispatchX11Events()
     if (XFilterEvent(&ev, mPlugWnd))
       continue;
 
+    const float scale = GetTotalScale();
     switch (ev.type)
     {
       case Expose:
@@ -2022,7 +2043,6 @@ void IGraphicsLinux::DispatchX11Events()
           }
         }
 
-        const float ss = GetScreenScale();
         const int physW = ce.width;
         const int physH = ce.height;
         // Check if the internal state already matches this physical
@@ -2040,11 +2060,14 @@ void IGraphicsLinux::DispatchX11Events()
         // avoid a resize oscillation.
         mInConfigureNotify = true;
 
-        const int width = static_cast<int>(physW / ss);
-        const int height = static_cast<int>(physH / ss);
-        Resize(width, height, 1.0f, false);
+        ResizeFromHost(physW, physH);
 
         mInConfigureNotify = false;
+        // A WM may ignore the aspect ratio or scale limits. Reconcile the child
+        // once; the resulting ConfigureNotify already matches our state.
+        if (physW != static_cast<int>(WindowWidth() * GetScreenScale()) ||
+            physH != static_cast<int>(WindowHeight() * GetScreenScale()))
+          PlatformResize(false);
         break;
       }
 
