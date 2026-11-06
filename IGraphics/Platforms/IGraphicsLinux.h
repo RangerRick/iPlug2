@@ -190,6 +190,8 @@ private:
   bool mCloseRequested = false;
   int mDispatchDepth = 0;
   unsigned long mLastLeftClickTime = 0;  // X11 server timestamp of last left-button press
+  float mLastLeftClickX = 0.f;
+  float mLastLeftClickY = 0.f;
 
   // Clipboard atoms (interned in OpenWindow)
   Atom mClipboardAtom = 0;

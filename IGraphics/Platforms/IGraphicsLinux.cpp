@@ -2112,9 +2112,15 @@ void IGraphicsLinux::DispatchX11Events()
 
         if (ev.type == ButtonPress)
         {
-          // X11 has no native double-click event; detect via timestamp.
+          // Measure distance in screen-logical pixels, independent of UI zoom.
           static constexpr unsigned long kDblClickTimeoutMs = 400;
-          if (left && (be.time - mLastLeftClickTime) < kDblClickTimeoutMs)
+          static constexpr float kDblClickDistance = 4.f;
+          const float clickX = be.x / GetScreenScale();
+          const float clickY = be.y / GetScreenScale();
+          if (left && mLastLeftClickTime &&
+              static_cast<uint32_t>(be.time - mLastLeftClickTime) < kDblClickTimeoutMs &&
+              std::fabs(clickX - mLastLeftClickX) <= kDblClickDistance &&
+              std::fabs(clickY - mLastLeftClickY) <= kDblClickDistance)
           {
             OnMouseDblClick(x, y, mod);
             mLastLeftClickTime = 0;  // reset so triple-click doesn't fire again
@@ -2122,8 +2128,9 @@ void IGraphicsLinux::DispatchX11Events()
           else
           {
             OnMouseDown(list);
-            if (left)
-              mLastLeftClickTime = be.time;
+            mLastLeftClickTime = left ? be.time : 0;
+            mLastLeftClickX = clickX;
+            mLastLeftClickY = clickY;
           }
         }
         else

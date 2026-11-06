@@ -631,6 +631,83 @@ static void TestResize()
   XCloseDisplay(host);
 }
 
+class ClickProbe final : public IControl
+{
+public:
+  explicit ClickProbe(const IRECT& bounds) : IControl(bounds) {}
+  void Draw(IGraphics&) override {}
+  void OnMouseDown(float, float, const IMouseMod&) override { ++mSingles; }
+  void OnMouseDblClick(float, float, const IMouseMod&) override { ++mDoubles; }
+  unsigned mSingles = 0;
+  unsigned mDoubles = 0;
+};
+
+static void TestDoubleClick()
+{
+  XInitThreads();
+  Display* host = XOpenDisplay(nullptr);
+  Check(host != nullptr, "open clicking host connection");
+  if (!host)
+    return;
+  for (const auto scales : {std::pair<float, float>{1.f, 1.f}, {2.f, 1.5f}, {1.f, .5f}})
+  {
+    TestDelegate delegate(true);
+    if (!delegate.OpenWindow(nullptr))
+    {
+      Check(false, "open editor for double clicks");
+      XCloseDisplay(host);
+      return;
+    }
+    auto& graphics = *static_cast<IGraphicsLinux*>(delegate.GetUI());
+    graphics.Resize(320, 240, scales.second);
+    graphics.SetScreenScale(scales.first);
+    auto* first = new ClickProbe(IRECT(20, 20, 100, 100));
+    auto* second = new ClickProbe(IRECT(120, 20, 220, 100));
+    graphics.AttachControl(first);
+    graphics.AttachControl(second);
+    const Window window = reinterpret_cast<uintptr_t>(graphics.GetWindow());
+    auto click = [&](float x, float y, uint32_t time, unsigned button = Button1) {
+      XEvent event {};
+      event.xbutton.display = host;
+      event.xbutton.window = window;
+      event.xbutton.root = DefaultRootWindow(host);
+      event.xbutton.time = time;
+      event.xbutton.button = button;
+      event.xbutton.x = static_cast<int>(x * graphics.GetTotalScale());
+      event.xbutton.y = static_cast<int>(y * graphics.GetTotalScale());
+      event.xbutton.same_screen = 1;
+      for (int type : {ButtonPress, ButtonRelease})
+      {
+        event.type = type;
+        XSendEvent(host, window, 0, type == ButtonPress ? ButtonPressMask : ButtonReleaseMask, &event);
+      }
+      XSync(host, 0);
+      graphics.ProcessX11Events();
+    };
+    click(50, 50, 1000);
+    click(150, 50, 1100);
+    Check(first->mSingles == 1 && second->mSingles == 1 && second->mDoubles == 0,
+          "quick clicks on distant controls remain single clicks");
+    click(150, 50, 1200);
+    Check(second->mDoubles == 1, "nearby consecutive clicks form a double click");
+    click(150, 50, 1300);
+    Check(second->mSingles == 2 && second->mDoubles == 1, "third click starts a new sequence");
+    click(150, 50, 1800);
+    Check(second->mSingles == 3, "click after timeout remains single");
+    // A 6px movement on screen must exceed the tolerance even at low drawing scale.
+    click(150 + 6.f / scales.second, 50, 1900);
+    Check(second->mSingles == 4 && second->mDoubles == 1,
+          "double-click distance is independent of drawing scale");
+    click(150, 50, 2000, Button3);
+    click(150, 50, 2100);
+    Check(second->mSingles == 6 && second->mDoubles == 1, "another mouse button interrupts the left-click sequence");
+    click(50, 50, UINT32_MAX - 50);
+    click(50, 50, 49);
+    Check(first->mDoubles == 1, "X11 timestamp wrap preserves double-click timing");
+  }
+  XCloseDisplay(host);
+}
+
 static void TestScaledKeys()
 {
   TestDelegate delegate(true);
@@ -967,6 +1044,8 @@ int main(int argc, char** argv)
     TestScaledKeys();
   else if (strcmp(argv[1], "resize") == 0)
     TestResize();
+  else if (strcmp(argv[1], "double-click") == 0)
+    TestDoubleClick();
   else if (strcmp(argv[1], "keyboard") == 0 || strcmp(argv[1], "keyboard-no-im") == 0 ||
            strcmp(argv[1], "keyboard-no-im-c") == 0)
     TestKeyboard(strcmp(argv[1], "keyboard") != 0, strcmp(argv[1], "keyboard-no-im-c") != 0);
