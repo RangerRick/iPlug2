@@ -1098,23 +1098,30 @@ bool IPlugCLAP::guiAdjustSize(uint32_t* pWidth, uint32_t* pHeight) noexcept
   {
     int w = *pWidth;
     int h = *pHeight;
-    ConstrainEditorResize(w, h);
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+    if (GetUI())
+      static_cast<IGraphicsLinux*>(GetUI())->ConstrainHostResize(w, h);
+    else
+#endif
+    {
+      ConstrainEditorResize(w, h);
 
 #ifndef NO_IGRAPHICS
-    // In Scale mode, enforce the design aspect ratio so the host
-    // doesn't allow sizes that would clip the top/bottom or sides.
-    if (GetUI() &&
-        GetUI()->GetResizerMode() == EUIResizerMode::Scale)
-    {
-      const int logW = GetEditorWidth();
-      const int logH = GetEditorHeight();
-      const float scaleX = static_cast<float>(w) / logW;
-      const float scaleY = static_cast<float>(h) / logH;
-      const float scale = std::min(scaleX, scaleY);
-      w = static_cast<int>(logW * scale);
-      h = static_cast<int>(logH * scale);
-    }
+      // In Scale mode, enforce the design aspect ratio so the host
+      // doesn't allow sizes that would clip the top/bottom or sides.
+      if (GetUI() &&
+          GetUI()->GetResizerMode() == EUIResizerMode::Scale)
+      {
+        const int logW = GetEditorWidth();
+        const int logH = GetEditorHeight();
+        const float scaleX = static_cast<float>(w) / logW;
+        const float scaleY = static_cast<float>(h) / logH;
+        const float scale = std::min(scaleX, scaleY);
+        w = static_cast<int>(logW * scale);
+        h = static_cast<int>(logH * scale);
+      }
 #endif
+    }
 
     *pWidth = w;
     *pHeight = h;

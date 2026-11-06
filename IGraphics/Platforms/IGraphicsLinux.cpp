@@ -999,20 +999,41 @@ void IGraphicsLinux::ResizeFromHost(int width, int height)
   if (width <= 0 || height <= 0)
     return;
 
-  int logicalWidth = static_cast<int>(std::lround(width / GetScreenScale()));
-  int logicalHeight = static_cast<int>(std::lround(height / GetScreenScale()));
-  GetDelegate()->ConstrainEditorResize(logicalWidth, logicalHeight);
+  int designWidth, designHeight;
+  float scale;
+  CalculateHostResize(width, height, designWidth, designHeight, scale);
+  Resize(designWidth, designHeight, scale, false);
+}
+
+void IGraphicsLinux::CalculateHostResize(int width, int height, int& designWidth, int& designHeight, float& scale)
+{
+  const float logicalWidth = width / GetScreenScale();
+  const float logicalHeight = height / GetScreenScale();
   if (GetResizerMode() == EUIResizerMode::Scale)
   {
-    const float scale = std::min(static_cast<float>(logicalWidth) / Width(),
-                                 static_cast<float>(logicalHeight) / Height());
-    Resize(Width(), Height(), scale, false);
+    designWidth = Width();
+    designHeight = Height();
+    scale = ConstrainDrawScale(std::min(logicalWidth / designWidth, logicalHeight / designHeight));
   }
   else
   {
-    Resize(static_cast<int>(std::lround(logicalWidth / GetDrawScale())),
-           static_cast<int>(std::lround(logicalHeight / GetDrawScale())), GetDrawScale(), false);
+    scale = ConstrainDrawScale(GetDrawScale());
+    designWidth = static_cast<int>(std::lround(logicalWidth / scale));
+    designHeight = static_cast<int>(std::lround(logicalHeight / scale));
   }
+  // Editor constraints describe design dimensions, before drawing/display scaling.
+  GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
+}
+
+void IGraphicsLinux::ConstrainHostResize(int& width, int& height)
+{
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+  int designWidth, designHeight;
+  float scale;
+  CalculateHostResize(width, height, designWidth, designHeight, scale);
+  // Match WindowWidth()/WindowHeight() and PlatformResize() rounding.
+  width = static_cast<int>(static_cast<int>(designWidth * scale) * GetScreenScale());
+  height = static_cast<int>(static_cast<int>(designHeight * scale) * GetScreenScale());
 }
 
 void IGraphicsLinux::ForceEndUserEdit()

@@ -1718,6 +1718,9 @@ public:
   void ClearGestureRegions();
 
 protected:
+  /** Apply the configured drawing-scale limits. */
+  float ConstrainDrawScale(float scale) const { return Clip(scale, mMinScale, mMaxScale); }
+
   /** Drawing API method to load a bitmap, called internally
    * @param fileNameOrResID A CString absolute path or resource ID
    * @param scale Integer to identify the scale of the resource, for multi-scale bitmaps

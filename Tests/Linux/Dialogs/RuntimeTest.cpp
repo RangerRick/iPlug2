@@ -627,6 +627,53 @@ static void TestResize()
     nativeResize(static_cast<int>(750 * screenScale), static_cast<int>(500 * screenScale));
     Check(graphics.Width() == 600 && graphics.Height() == 400 && graphics.GetDrawScale() == 1.25f,
           "X11 Size mode accounts for both screen and drawing scale");
+
+    graphics.Resize(320, 240, 1.25f);
+    delegate.SetSizeConstraints(200, 400, 160, 300);
+    int proposedWidth = static_cast<int>(750 * screenScale);
+    int proposedHeight = static_cast<int>(500 * screenScale);
+    graphics.ConstrainHostResize(proposedWidth, proposedHeight);
+    Check(proposedWidth == static_cast<int>(500 * screenScale) &&
+          proposedHeight == static_cast<int>(375 * screenScale),
+          "host Size constraints convert design maxima back to physical pixels");
+    Check(graphics.Width() == 320 && graphics.Height() == 240,
+          "querying host constraints does not resize the editor");
+    delegate.OnParentWindowResize(proposedWidth, proposedHeight);
+    Check(graphics.Width() == 400 && graphics.Height() == 300,
+          "Size mode applies maximum constraints after removing drawing scale");
+    graphics.ProcessX11Events();
+    nativeResize(static_cast<int>(125 * screenScale), static_cast<int>(100 * screenScale));
+    Check(graphics.Width() == 200 && graphics.Height() == 160 && graphics.GetDrawScale() == 1.25f,
+          "native Size resizing respects design minima with zoom and HiDPI");
+    nativeResize(static_cast<int>(500 * screenScale), static_cast<int>(375 * screenScale));
+    Check(graphics.Width() == 400 && graphics.Height() == 300,
+          "native Size resizing can reach the zoomed design maxima");
+
+    graphics.AttachCornerResizer(EUIResizerMode::Scale, false);
+    graphics.Resize(320, 240, 1.f);
+    delegate.SetSizeConstraints(320, 320, 240, 240);
+    proposedWidth = static_cast<int>(480 * screenScale);
+    proposedHeight = static_cast<int>(360 * screenScale);
+    graphics.ConstrainHostResize(proposedWidth, proposedHeight);
+    Check(proposedWidth == static_cast<int>(480 * screenScale) &&
+          proposedHeight == static_cast<int>(360 * screenScale),
+          "fixed design constraints allow a scaled host window");
+    delegate.OnParentWindowResize(proposedWidth, proposedHeight);
+    Check(graphics.Width() == 320 && graphics.Height() == 240 && graphics.GetDrawScale() == 1.5f,
+          "host Scale resizing preserves fixed design constraints");
+    graphics.ProcessX11Events();
+    nativeResize(static_cast<int>(640 * screenScale), static_cast<int>(480 * screenScale));
+    Check(graphics.Width() == 320 && graphics.Height() == 240 && graphics.GetDrawScale() == 2.f,
+          "native Scale resizing preserves fixed design constraints");
+    graphics.SetScaleConstraints(.75f, 2.f);
+    proposedWidth = static_cast<int>(960 * screenScale);
+    proposedHeight = static_cast<int>(720 * screenScale);
+    graphics.ConstrainHostResize(proposedWidth, proposedHeight);
+    Check(proposedWidth == static_cast<int>(640 * screenScale) &&
+          proposedHeight == static_cast<int>(480 * screenScale),
+          "host size negotiation respects drawing-scale limits at HiDPI");
+    delegate.SetSizeConstraints(10, 100000, 10, 100000);
+    graphics.SetScaleConstraints(.5f, 4.f);
   }
   XCloseDisplay(host);
 }

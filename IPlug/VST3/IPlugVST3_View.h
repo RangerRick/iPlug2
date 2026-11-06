@@ -116,7 +116,14 @@ public:
     int w = pRect->getWidth();
     int h = pRect->getHeight();
 
-    if(!mOwner.ConstrainEditorResize(w, h))
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+    if (mOwner.GetUI())
+      static_cast<iplug::igraphics::IGraphicsLinux*>(mOwner.GetUI())->ConstrainHostResize(w, h);
+    else
+#endif
+      mOwner.ConstrainEditorResize(w, h);
+
+    if(w != pRect->getWidth() || h != pRect->getHeight())
     {
       pRect->right = pRect->left + w;
       pRect->bottom = pRect->top + h;

@@ -108,6 +108,8 @@ public:
   void DrawResize() override;
   /** Apply a host/X11 size in physical pixels, preserving the configured resize mode. */
   void ResizeFromHost(int width, int height);
+  /** Constrain a proposed host size in physical pixels without resizing the editor. */
+  void ConstrainHostResize(int& width, int& height);
 
   void HideMouseCursor(bool hide, bool lock) override;
   void MoveMouseCursor(float x, float y) override;
@@ -142,6 +144,7 @@ protected:
   void CreatePlatformTextEntry(int paramIdx, const IText& text, const IRECT& bounds, int length, const char* str) override;
 
 private:
+  void CalculateHostResize(int width, int height, int& designWidth, int& designHeight, float& scale);
   struct DispatchScope
   {
     explicit DispatchScope(int& depth) : mDepth(depth) { ++mDepth; }
