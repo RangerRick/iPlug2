@@ -3,6 +3,7 @@
 #include <X11/Xresource.h>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -147,6 +148,11 @@ public:
   void EndInformHostOfParamChangeFromUI(int) override
   {
     Check(false, "unexpected parameter gesture");
+  }
+  bool EditorResizeFromUI(int width, int height, bool) override
+  {
+    SetEditorSize(width, height);
+    return false; // The test has no parent resize callback.
   }
   void OnUIClose() override
   {
@@ -678,6 +684,79 @@ static void TestResize()
   XCloseDisplay(host);
 }
 
+static void TestResizeRoundtrip()
+{
+  sSynchronousResize = true;
+  TestDelegate delegate(true);
+  if (!delegate.OpenWindow(nullptr))
+  {
+    Check(false, "open editor for resize round trips");
+    return;
+  }
+  auto& graphics = *static_cast<IGraphicsLinux*>(delegate.GetUI());
+  Display* host = XOpenDisplay(nullptr);
+  Check(host != nullptr, "open host connection for resize round trips");
+  if (!host)
+    return;
+  const Window window = reinterpret_cast<uintptr_t>(graphics.GetWindow());
+  auto checkSize = [&](int width, int height) {
+    Check(static_cast<int>(graphics.WindowWidth() * graphics.GetScreenScale()) == width &&
+          static_cast<int>(graphics.WindowHeight() * graphics.GetScreenScale()) == height,
+          "rendering honors the host-adjusted physical dimensions");
+    Check(delegate.GetEditorWidth() == width && delegate.GetEditorHeight() == height,
+          "the delegate reports the host-adjusted physical dimensions");
+    XWindowAttributes attributes {};
+    Check(XGetWindowAttributes(host, window, &attributes) &&
+          attributes.width == width && attributes.height == height,
+          "the X11 child matches the host-adjusted physical dimensions");
+  };
+  for (auto mode : {EUIResizerMode::Scale, EUIResizerMode::Size})
+  for (auto design : {std::pair<int, int>{320, 240}, {317, 239}})
+  for (float screenScale : {1.f, 1.25f, 1.5f, 2.f})
+  for (float drawScale : {.625f, 1.f, 1.25f})
+  {
+    delegate.SetSizeConstraints(10, 640, 10, 480);
+    graphics.SetScaleConstraints(.5f, 2.f);
+    graphics.AttachCornerResizer(mode, false);
+    graphics.Resize(design.first, design.second, drawScale);
+    graphics.SetScreenScale(screenScale);
+    if (mode == EUIResizerMode::Scale)
+      delegate.SetSizeConstraints(design.first, design.first, design.second, design.second);
+    else if (drawScale == 1.25f)
+      delegate.SetSizeConstraints(10, INT_MAX, 10, INT_MAX);
+    // Include non-binary scale limits as well as exact quarter/half scales.
+    if (drawScale == 1.f)
+      graphics.SetScaleConstraints(.73f, 1.61f);
+    for (auto request : {std::pair<int, int>{483, 362}, {322, 241}, {511, 387},
+                         {1200, 900}, {80, 60}, {713, 529}})
+    {
+      int width = request.first, height = request.second;
+      graphics.ConstrainHostResize(width, height);
+      for (int repeat = 0; repeat < 4; ++repeat)
+      {
+        int againWidth = width, againHeight = height;
+        graphics.ConstrainHostResize(againWidth, againHeight);
+        Check(width == againWidth && height == againHeight,
+              "repeated host size negotiation does not change the adjusted size");
+        delegate.OnParentWindowResize(width, height);
+        graphics.ProcessX11Events();
+        checkSize(width, height);
+      }
+      XResizeWindow(host, window, request.first, request.second);
+      XSync(host, 0);
+      graphics.ProcessX11Events();
+      checkSize(width, height);
+      graphics.ProcessX11Events();
+      checkSize(width, height);
+      if (mode == EUIResizerMode::Scale)
+        Check(graphics.Width() == design.first && graphics.Height() == design.second,
+              "round-trip resizing preserves the Scale-mode design dimensions");
+    }
+  }
+  XCloseDisplay(host);
+  sSynchronousResize = false;
+}
+
 class ClickProbe final : public IControl
 {
 public:
@@ -1091,6 +1170,8 @@ int main(int argc, char** argv)
     TestScaledKeys();
   else if (strcmp(argv[1], "resize") == 0)
     TestResize();
+  else if (strcmp(argv[1], "resize-roundtrip") == 0)
+    TestResizeRoundtrip();
   else if (strcmp(argv[1], "double-click") == 0)
     TestDoubleClick();
   else if (strcmp(argv[1], "keyboard") == 0 || strcmp(argv[1], "keyboard-no-im") == 0 ||

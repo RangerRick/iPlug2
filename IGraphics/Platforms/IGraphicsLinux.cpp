@@ -20,6 +20,7 @@
 #include <poll.h>
 #include <cerrno>
 #include <climits>
+#include <limits>
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
 
@@ -63,6 +64,14 @@ static constexpr int TIMER_INTERVAL_US = 16667;
 
 namespace
 {
+// Match WindowWidth()/WindowHeight() followed by the X11/display-scale conversion.
+double PhysicalWindowDimension(int designDimension, float drawScale, float screenScale)
+{
+  // Probe large candidates without overflowing int; actual window sizes fit in int.
+  const float logical = std::trunc(designDimension * drawScale);
+  return std::trunc(logical * screenScale);
+}
+
 class LinuxClipboard
 {
 public:
@@ -1007,22 +1016,71 @@ void IGraphicsLinux::ResizeFromHost(int width, int height)
 
 void IGraphicsLinux::CalculateHostResize(int width, int height, int& designWidth, int& designHeight, float& scale)
 {
-  const float logicalWidth = width / GetScreenScale();
-  const float logicalHeight = height / GetScreenScale();
+  const float screenScale = GetScreenScale();
+  const auto pixels = [screenScale](int dimension, float candidateScale) {
+    return PhysicalWindowDimension(dimension, candidateScale, screenScale);
+  };
   if (GetResizerMode() == EUIResizerMode::Scale)
   {
     designWidth = Width();
     designHeight = Height();
-    scale = ConstrainDrawScale(std::min(logicalWidth / designWidth, logicalHeight / designHeight));
+    GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
+
+    const auto fits = [&](float candidateScale) {
+      return pixels(designWidth, candidateScale) <= width &&
+             pixels(designHeight, candidateScale) <= height;
+    };
+    float lo = ConstrainDrawScale(0.f);
+    float hi = ConstrainDrawScale(std::numeric_limits<float>::max());
+    if (fits(hi))
+      lo = hi;
+    else if (fits(lo))
+    {
+      // Find the last representable scale that fits the requested pixel bounds.
+      // Inverting their lower edges loses a pixel at each integer conversion.
+      // Querying the resulting dimensions admits this same scale again.
+      for (;;)
+      {
+        const float mid = lo + (hi - lo) * .5f;
+        if (mid == lo || mid == hi)
+          break;
+        if (fits(mid))
+          lo = mid;
+        else
+          hi = mid;
+      }
+    }
+    scale = lo;
+    // Keep exact scales such as 1.5 when they produce the same pixel dimensions.
+    const float nominalScale = ConstrainDrawScale(std::min(width / screenScale / designWidth,
+                                                            height / screenScale / designHeight));
+    if (pixels(designWidth, nominalScale) == pixels(designWidth, scale) &&
+        pixels(designHeight, nominalScale) == pixels(designHeight, scale))
+      scale = nominalScale;
   }
   else
   {
     scale = ConstrainDrawScale(GetDrawScale());
-    designWidth = static_cast<int>(std::lround(logicalWidth / scale));
-    designHeight = static_cast<int>(std::lround(logicalHeight / scale));
+    // Use the same upper-bound search for integer design pixels in Size mode.
+    const auto fitDimension = [&](int requested, int maximum) {
+      int lo = 0, hi = maximum;
+      while (lo < hi)
+      {
+        const int mid = hi - (hi - lo) / 2;
+        if (pixels(mid, scale) <= requested)
+          lo = mid;
+        else
+          hi = mid - 1;
+      }
+      const int nominal = static_cast<int>(std::lround(std::min<double>(maximum,
+                                                    requested / screenScale / scale)));
+      return pixels(nominal, scale) == pixels(lo, scale) ? nominal : lo;
+    };
+    designWidth = fitDimension(width, GetDelegate()->GetMaxWidth());
+    designHeight = fitDimension(height, GetDelegate()->GetMaxHeight());
+    // Editor constraints describe dimensions before drawing/display scaling.
+    GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
   }
-  // Editor constraints describe design dimensions, before drawing/display scaling.
-  GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
 }
 
 void IGraphicsLinux::ConstrainHostResize(int& width, int& height)
@@ -1031,9 +1089,8 @@ void IGraphicsLinux::ConstrainHostResize(int& width, int& height)
   int designWidth, designHeight;
   float scale;
   CalculateHostResize(width, height, designWidth, designHeight, scale);
-  // Match WindowWidth()/WindowHeight() and PlatformResize() rounding.
-  width = static_cast<int>(static_cast<int>(designWidth * scale) * GetScreenScale());
-  height = static_cast<int>(static_cast<int>(designHeight * scale) * GetScreenScale());
+  width = static_cast<int>(PhysicalWindowDimension(designWidth, scale, GetScreenScale()));
+  height = static_cast<int>(PhysicalWindowDimension(designHeight, scale, GetScreenScale()));
 }
 
 void IGraphicsLinux::ForceEndUserEdit()
