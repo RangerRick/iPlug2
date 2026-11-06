@@ -5,9 +5,7 @@
 class LinuxFailedEditor final : public iplug::Plugin
 {
 public:
-  explicit LinuxFailedEditor(const iplug::InstanceInfo& info)
-  : iplug::Plugin(info, iplug::MakeConfig(0, 1))
-  {}
+  explicit LinuxFailedEditor(const iplug::InstanceInfo& info);
 
   void* OpenWindow(void*) override { return nullptr; }
 };
