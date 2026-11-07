@@ -208,8 +208,10 @@ void TestMessages(IGraphicsLinux& graphics)
       Check(callbacks == 1, "message callback called exactly once");
     }
   }
-  Check(graphics.ShowMessageBox("Test", "Invalid type", static_cast<EMsgBoxType>(99), nullptr) == kCANCEL,
-        "invalid message type safely cancels without a callback");
+  // 2 is within the enum's representable range, but is not a supported button
+  // set. Casting 99 would make the test itself invoke undefined behavior.
+  Check(graphics.ShowMessageBox("Test", "Unsupported type", static_cast<EMsgBoxType>(2), nullptr) == kCANCEL,
+        "unsupported message type safely cancels without a callback");
 }
 
 void TestFiles(IGraphicsLinux& graphics, const std::string& folder)

@@ -145,6 +145,8 @@ scan paths or use an audio device. Deployment fixtures copy only inside the test
 build directory. The tests require `xvfb`, `xauth`, and Mesa's software renderer
 (`libgl1-mesa-dri` on Ubuntu/Debian), in addition to the Linux build dependencies.
 The host tests require the VST3 SDK, CLAP SDK, and CLAP helpers headers.
+The standard build targets below also build the GTK clipboard and core timer
+regression executables through target dependencies.
 
 ```bash
 cmake -S Tests/Linux -B build/linux-regression -DCMAKE_BUILD_TYPE=Release
@@ -153,6 +155,27 @@ cmake --build build/linux-regression --parallel 2 \
   LinuxDialogTest LinuxRuntimeTest LinuxClapHostTest LinuxVst3HostTest LinuxOscTest
 ctest --test-dir build/linux-regression --output-on-failure
 ```
+
+The CLAP/VST3 host fixtures also process known stereo input without an audio
+device, save and restore the gain parameter, and check output samples and buffer
+boundaries at 1, 64, 127 and 512 frames and 44.1/48 kHz. VST3 covers both 32-bit
+and 64-bit sample buffers; CLAP covers 32-bit buffers and partial state-stream
+reads/writes. Processing runs on a separate audio thread.
+
+Host-scale tests cover notification before attachment (and before the VST3
+frame), visible scale changes, fractional factors, invalid values, environment
+override priority, and CLAP hide/show. Click-focus tests route key events through
+the X server's current input focus rather than directly invoking a key handler.
+The GTK clipboard test owns the selection on the same UI thread as the editor
+and requests editor shutdown during a pending paste.
+
+Linux Ninja CI covers GCC x86_64, GCC ARM64 and Clang with ASan/UBSan. GL/GTK
+process-wide caches are excluded from leak checking; the core timer lifecycle
+test runs separately with leak detection enabled. Clang's Linux byte-swap
+compatibility is supplied by `IPlug/IPlugLinuxHeaders.h`, without changing WDL.
+Four timer-entry-point fault-injection cases run only in the GCC jobs: ASan
+substitutes its own pthread entry point, which prevents the injection shim from
+identifying the timer callback. The timer lifecycle tests still run under ASan.
 
 The suite checks repeated GUI startup, rendering and normal shutdown,
 main-loop timer/display initialization failures, ALSA error
@@ -280,6 +303,9 @@ clipboard connection or start its worker is logged and reported to the caller.
 Clipboard replies use checked XCB requests on that dedicated connection. A paste
 target disappearing during a transfer cancels the reply without invoking the
 host's X11 error handler or replacing that handler process-wide.
+Synchronous paste also services pending GTK events so that a host clipboard
+owner on the same UI thread can answer. Editor close requests during this wait
+are deferred until paste returns; a close cancels the wait.
 Linux resource lookup resolves module symlinks before searching adjacent resources.
 Flat binaries use an adjacent, binary-specific directory such as
 `MyPlugin.clap.resources/ttf/Roboto-Regular.ttf` or
@@ -289,6 +315,10 @@ beside the resolved binary. When installing manually, keep the binary and its
 `.resources` directory together. VST3 keeps the existing `Contents/Resources/`
 bundle layout. The old shared `resources/` directory is no longer searched:
 rebuild and redeploy Linux binaries to populate the isolated directories.
+Resource inputs are link dependencies on Linux and macOS, so a resource-only
+edit also runs post-build deployment. Linux deployment tests exercise both
+Ninja and Make, flat files and VST3 bundles, and COPY/SYMLINK deployment, using
+mutable inputs inside the test build directory.
 
 For interactive standalone testing, `IPlugEffect --no-io` opens only the editor.
 Linux preserves ALSA diagnostics; audio startup failures leave the editor available
@@ -296,6 +326,28 @@ for changing audio settings, while window/editor startup failures return a nonze
 exit status. Native Linux requires a working ALSA device or JACK server. On WSLg,
 an installed JACK client library alone does not provide a server or a route to
 Windows audio; that routing must be configured separately.
+
+#### Validation before an upstream merge
+
+Xvfb and the small host fixtures do not replace interactive DAW testing. Record
+the host/version, display server, GPU/driver and display scale when checking:
+
+- Multiple instances, repeated editor opening, docking, and project reload.
+- Host-to-editor and editor-to-host keyboard focus, Compose/IME input, and GTK
+  dialog focus restoration.
+- XWayland and movement between monitors with different display scales.
+- Real ALSA/JACK audio, device changes, processing restart, and state restore.
+
+These interactive cases, Windows execution and hardware GPU behavior have not
+been established by the headless Linux regression suite. Native Wayland, Skia
+and WebView remain outside the implemented Linux support scope.
+
+The Linux-support diff also contains two existing vendored patches that should
+be reviewed separately from the platform implementation: SWELL INI writes now
+report file/flush/rename failures through their return values, and NanoVG's
+packed depth/stencil fallback uses the combined framebuffer attachment. Keep
+their reproduction evidence and macOS/Windows validation with those patches;
+Linux software-GL success alone does not establish cross-platform correctness.
 
 ### Linux OSC polling
 

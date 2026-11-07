@@ -871,10 +871,41 @@ jobs:
   # Linux - Ninja Generator (Default)
   # ============================================================================
   linux-ninja:
-    name: Linux (Ninja)
+    name: ${{ matrix.name }}
     needs: parse-commands
     if: needs.parse-commands.outputs.should_run == 'true'
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: gcc-x64
+            name: Linux (Ninja)
+            runner: ubuntu-22.04
+            cc: gcc
+            cxx: g++
+            sanitizers: false
+          - label: gcc-arm64
+            name: Linux (Ninja, GCC ARM64)
+            runner: ubuntu-22.04-arm
+            cc: gcc
+            cxx: g++
+            sanitizers: false
+          - label: clang-sanitizers
+            name: Linux (Ninja, Clang sanitizers)
+            runner: ubuntu-22.04
+            cc: clang
+            cxx: clang++
+            sanitizers: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CFLAGS: ${{ matrix.sanitizers && '-fsanitize=address,undefined -fno-omit-frame-pointer' || '' }}
+      CXXFLAGS: ${{ matrix.sanitizers && '-fsanitize=address,undefined -fno-omit-frame-pointer' || '' }}
+      LDFLAGS: ${{ matrix.sanitizers && '-fsanitize=address,undefined' || '' }}
+      # GL/GTK retain process-wide caches; run leak checking separately for the core timer.
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -907,6 +938,10 @@ jobs:
             libxrandr-dev \
             libxfixes-dev \
             libxcursor-dev
+
+      - name: Install Clang sanitizer runtime
+        if: matrix.sanitizers
+        run: sudo apt-get install -y --no-install-recommends clang libclang-rt-14-dev
 
       - name: Cache SDKs
         id: cache-sdks
@@ -956,10 +991,16 @@ jobs:
       - name: Run Linux regression tests
         run: ctest --test-dir build/linux-regression --output-on-failure
 
+      - name: Check core timer leaks
+        if: matrix.sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: ctest --test-dir build/linux-regression -R '^linux-timer-lifecycle$' --output-on-failure
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-ninja-artifacts
+          name: linux-ninja-${{ matrix.label }}-artifacts
           path: build/linux-ninja/out/
           if-no-files-found: warn
 

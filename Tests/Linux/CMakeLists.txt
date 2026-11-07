@@ -30,6 +30,10 @@ foreach(target IPlugEffect-app LinuxIdleProbe-app)
 endforeach()
 
 add_library(LinuxStartupHooks SHARED StartupHooks.cpp)
+# This interposer is also preloaded into xvfb-run's unsanitized shell/tools.
+# Instrument the tested binaries, not the fault-injection shim.
+target_compile_options(LinuxStartupHooks PRIVATE -fno-sanitize=all)
+target_link_options(LinuxStartupHooks PRIVATE -fno-sanitize=all)
 target_include_directories(LinuxStartupHooks PRIVATE ${X11_INCLUDE_DIR} ${ALSA_INCLUDE_DIRS})
 target_link_libraries(LinuxStartupHooks PRIVATE ${CMAKE_DL_LIBS} pthread ${ALSA_LIBRARIES})
 
@@ -162,4 +166,13 @@ if(TARGET LinuxIdleProbe-clap)
   add_test(NAME linux-clap-idle-headless
     COMMAND "$<TARGET_FILE:LinuxClapHostTest>" "$<TARGET_FILE:LinuxIdleHeadless-clap>" idle-headless)
   set_tests_properties(linux-clap-idle-headless PROPERTIES TIMEOUT 15)
+endif()
+
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=[^ ]*address")
+  # ASan wraps the pthread entry point, hiding Timer_impl::ThreadProc from the
+  # preload shim's dladdr-based fault injection. GCC jobs run these four cases;
+  # the actual timer lifecycle tests still run under ASan (including leaks).
+  if(TARGET LinuxClapHostTest)
+    set_tests_properties(linux-clap-fallback-fail linux-clap-idle-fail PROPERTIES DISABLED TRUE)
+  endif()
 endif()

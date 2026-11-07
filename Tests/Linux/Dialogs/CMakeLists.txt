@@ -44,3 +44,8 @@ foreach(mode focus close glx-context resize resize-roundtrip double-click scaled
   set_tests_properties(linux-${mode} PROPERTIES TIMEOUT 15
     ENVIRONMENT "LIBGL_ALWAYS_SOFTWARE=1;LD_PRELOAD=$<TARGET_FILE:LinuxStartupHooks>;IPLUG_LINUX_TEST_MODE=${mode}")
 endforeach()
+
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=[^ ]*address")
+  # ASan substitutes the pthread entry point inspected by the injection shim.
+  set_tests_properties(linux-core-timer-fail linux-core-timer-early PROPERTIES DISABLED TRUE)
+endif()
