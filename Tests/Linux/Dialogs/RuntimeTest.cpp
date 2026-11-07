@@ -567,6 +567,75 @@ static void CheckText(const std::string& actual, const char* expected, const cha
   }
 }
 
+static void TestFocus()
+{
+  TestDelegate delegate(true);
+  Display* host = XOpenDisplay(nullptr);
+  Check(host != nullptr, "open focus host connection");
+  if (!host)
+    return;
+  const Window parent = XCreateSimpleWindow(host, DefaultRootWindow(host), 0, 0, 640, 480, 0, 0, 0);
+  const Window sibling = XCreateSimpleWindow(host, parent, 400, 0, 100, 100, 0, 0, 0);
+  XMapWindow(host, parent);
+  XMapWindow(host, sibling);
+  XSetInputFocus(host, sibling, RevertToParent, 0);
+  XSync(host, 0);
+  if (delegate.OpenWindow(reinterpret_cast<void*>(static_cast<uintptr_t>(parent))))
+  {
+    auto& graphics = *static_cast<IGraphicsLinux*>(delegate.GetUI());
+    auto* probe = new KeyProbe();
+    graphics.AttachControl(probe);
+    const Window editor = reinterpret_cast<uintptr_t>(graphics.GetWindow());
+    XSync(host, 0);
+    Window focus = 0;
+    int revert = 0;
+    XGetInputFocus(host, &focus, &revert);
+    Check(focus == sibling, "opening an embedded editor does not steal focus");
+    XWarpPointer(host, 0, editor, 0, 0, 0, 0, 80, 64);
+    XEvent event {};
+    event.xbutton.type = ButtonPress;
+    event.xbutton.display = host;
+    event.xbutton.window = editor;
+    event.xbutton.root = DefaultRootWindow(host);
+    event.xbutton.button = Button1;
+    event.xbutton.x = 80;
+    event.xbutton.y = 64;
+    event.xbutton.same_screen = 1;
+    XSendEvent(host, editor, 0, ButtonPressMask, &event);
+    event.xbutton.type = ButtonRelease;
+    XSendEvent(host, editor, 0, ButtonReleaseMask, &event);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+    XGetInputFocus(host, &focus, &revert);
+    Check(focus == editor, "click transfers keyboard focus from host sibling to editor");
+    event = {};
+    event.xkey.type = KeyPress;
+    event.xkey.display = host;
+    event.xkey.window = editor;
+    event.xkey.root = DefaultRootWindow(host);
+    event.xkey.keycode = XKeysymToKeycode(host, XK_a);
+    event.xkey.x = 80;
+    event.xkey.y = 64;
+    event.xkey.same_screen = 1;
+    // Destination 1 is X11 InputFocus: route through actual server focus.
+    XSendEvent(host, 1, 0, KeyPressMask, &event);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+    Check(probe->mText == "a", "keyboard input follows click focus into editor");
+    XSetInputFocus(host, sibling, RevertToParent, 0);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+    graphics.OnDisplayTimer();
+    XGetInputFocus(host, &focus, &revert);
+    Check(focus == sibling, "editor ticks preserve focus returned to host");
+    delegate.CloseWindow();
+  }
+  else
+    Check(false, "open editor for focus test");
+  XDestroyWindow(host, parent);
+  XCloseDisplay(host);
+}
+
 static void TestResize()
 {
   struct SynchronousResize
@@ -1168,6 +1237,8 @@ int main(int argc, char** argv)
     TestGLXContext();
   else if (strcmp(argv[1], "scaled-keys") == 0)
     TestScaledKeys();
+  else if (strcmp(argv[1], "focus") == 0)
+    TestFocus();
   else if (strcmp(argv[1], "resize") == 0)
     TestResize();
   else if (strcmp(argv[1], "resize-roundtrip") == 0)

@@ -1476,6 +1476,12 @@ bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
   if (!owner)
     return false;
 
+  // Native clipboard owners in the host may need the same GTK main thread to
+  // answer. Like modal dialogs, this wait can reenter host callbacks: defer any
+  // editor teardown until the synchronous paste has returned to its caller.
+  DispatchScope dispatch(mDispatchDepth);
+  GTK3* gtk = LoadGTK3();
+
   // Ask the clipboard owner to convert to UTF-8 and store in our scratch property
   XConvertSelection(mDisplay, mClipboardAtom, mUTF8StringAtom, mSelDataAtom,
                     mPlugWnd, 0L /* CurrentTime */);
@@ -1484,6 +1490,10 @@ bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
   // Keep the event consumer locked out until we have read SelectionNotify.
   for (int i = 0; i < 50; ++i)
   {
+    if (gtk && gtk->events_pending && gtk->main_iteration_do && gtk->events_pending())
+      gtk->main_iteration_do(0);
+    if (mCloseRequested)
+      return false;
     usleep(10000); // 10 ms
 
     XEvent ev;
@@ -2205,6 +2215,10 @@ void IGraphicsLinux::DispatchX11Events()
 
         if (ev.type == ButtonPress)
         {
+          // A child of the host's window does not gain focus automatically.
+          // Only an explicit click transfers focus; mapping/hovering never does.
+          XSetInputFocus(mDisplay, mPlugWnd, RevertToParent, be.time);
+          XFlush(mDisplay);
           // Measure distance in screen-logical pixels, independent of UI zoom.
           static constexpr unsigned long kDblClickTimeoutMs = 400;
           static constexpr float kDblClickDistance = 4.f;
