@@ -30,6 +30,8 @@ static void Check(bool condition, const char* message)
   }
 }
 
+#include "Vst3AudioTest.h"
+
 class Host final : public IPlugFrame, public Linux::IRunLoop, public IComponentHandler
 {
 public:
@@ -232,6 +234,17 @@ int main(int argc, char** argv)
   {
     fprintf(stderr, "Could not initialize VST3 component\n");
     return 1;
+  }
+  if (strcmp(mode, "audio-state") == 0)
+  {
+    TestAudio(component);
+    component->terminate();
+    component->release();
+    host.CheckStopped();
+    factory->release();
+    exit();
+    dlclose(library);
+    return sFailures ? 1 : 0;
   }
   if (strcmp(mode, "idle-headless") == 0)
   {

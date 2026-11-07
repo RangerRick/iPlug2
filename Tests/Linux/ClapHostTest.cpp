@@ -24,6 +24,8 @@ static void Check(bool condition, const char* message)
   }
 }
 
+#include "ClapAudioTest.h"
+
 struct Host
 {
   clap_host_t api {};
@@ -113,7 +115,7 @@ struct Host
     };
     static const clap_host_thread_check_t threads {
       [](const clap_host_t* host) { return Get(host).mainThread == std::this_thread::get_id(); },
-      [](const clap_host_t*) { return false; }
+      [](const clap_host_t*) { return sAudioThread; }
     };
     static const clap_host_params_t params {
       [](const clap_host_t*, clap_param_rescan_flags) {},
@@ -242,6 +244,14 @@ int main(int argc, char** argv)
     entry->deinit();
     dlclose(library);
     return 1;
+  }
+  if (mode == "audio-state")
+  {
+    TestAudio(plugin);
+    plugin->destroy(plugin);
+    entry->deinit();
+    dlclose(library);
+    return sFailures ? 1 : 0;
   }
   if (idleProbe)
   {
