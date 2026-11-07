@@ -84,6 +84,15 @@ function(_iplug_add_resources target resources)
   set_source_files_properties(${resources} PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources
   )
+  if(UNIX AND NOT EMSCRIPTEN)
+    # A resource-only edit must also run POST_BUILD deployment. On Apple the
+    # bundle copy rule alone need not relink; Linux copies resources after link.
+    # Keep that ordering by making the link depend on the resource inputs.
+    foreach(_res IN LISTS resources)
+      get_filename_component(_abs_res "${_res}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+      set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_abs_res}")
+    endforeach()
+  endif()
   if(UNIX AND NOT APPLE)
     # On Linux: copy resources so that IPlugPaths.cpp's LocateResource can find them.
     #   Flat APP/CLAP targets -> <target-file>.resources/<type>/<file>

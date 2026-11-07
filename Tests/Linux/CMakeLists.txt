@@ -112,6 +112,16 @@ add_test(NAME linux-deployment-symlink
     -P "${CMAKE_CURRENT_SOURCE_DIR}/CheckDeployment.cmake")
 set_tests_properties(linux-deployment-symlink PROPERTIES TIMEOUT 120)
 
+foreach(method COPY SYMLINK)
+  string(TOLOWER "${method}" method_name)
+  add_test(NAME linux-deployment-ninja-${method_name}
+    COMMAND "${CMAKE_COMMAND}" "-DIPLUG2_DIR=${IPLUG2_DIR}"
+      "-DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/deployment-ninja-${method_name}"
+      -DTEST_GENERATOR=Ninja "-DTEST_DEPLOY_METHOD=${method}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/CheckDeployment.cmake")
+  set_tests_properties(linux-deployment-ninja-${method_name} PROPERTIES TIMEOUT 120)
+endforeach()
+
 if(TARGET IPlugEffect-clap)
   add_executable(LinuxClapHostTest ClapHostTest.cpp)
   target_include_directories(LinuxClapHostTest PRIVATE ${X11_INCLUDE_DIR}

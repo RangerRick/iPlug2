@@ -8,7 +8,11 @@ endif()
 if(NOT TEST_DEPLOY_METHOD)
   set(TEST_DEPLOY_METHOD COPY)
 endif()
+if(NOT TEST_GENERATOR)
+  set(TEST_GENERATOR "Unix Makefiles")
+endif()
 execute_process(COMMAND "${CMAKE_COMMAND}"
+  -G "${TEST_GENERATOR}"
   -S "${IPLUG2_DIR}/Tests/Linux/Deployment" -B "${TEST_BINARY_DIR}"
   "-DIPLUG2_DIR=${IPLUG2_DIR}" "-DTEST_DEPLOY_METHOD=${TEST_DEPLOY_METHOD}"
   RESULT_VARIABLE result)
@@ -58,6 +62,18 @@ endfunction()
 check_resource(Deferred.clap "deployment resource\n")
 check_resource(Alpha.clap "alpha resource\n")
 check_resource("Bundled.vst3/Contents/test-linux/Bundled.so" "bundle resource\n")
+# Mutate build-local inputs, leaving the repository fixtures untouched. Make's
+# timestamp resolution requires the edit to follow the first link by a second.
+execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 1)
+file(WRITE "${TEST_BINARY_DIR}/Mutable/late.txt" "updated flat resource\n")
+file(WRITE "${TEST_BINARY_DIR}/Bundled/late.txt" "updated bundle resource\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" --build "${TEST_BINARY_DIR}" --target Deferred Bundled
+  RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "Resource-only incremental build failed")
+endif()
+check_resource(Deferred.clap "updated flat resource\n")
+check_resource("Bundled.vst3/Contents/test-linux/Bundled.so" "updated bundle resource\n")
 execute_process(COMMAND "${CMAKE_COMMAND}" --build "${TEST_BINARY_DIR}" --target Beta-clap
   RESULT_VARIABLE result)
 if(NOT result EQUAL 0)

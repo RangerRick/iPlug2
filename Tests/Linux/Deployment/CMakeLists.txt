@@ -20,7 +20,8 @@ target_compile_definitions(Deferred PRIVATE OS_LINUX)
 target_compile_options(Deferred PRIVATE -fsigned-char -include stdlib.h)
 target_link_libraries(Deferred PRIVATE ${CMAKE_DL_LIBS})
 iplug_configure_target(Deferred CLAP Deferred DEFER_DEPLOYMENT)
-_iplug_add_resources(Deferred "${CMAKE_CURRENT_SOURCE_DIR}/late.txt")
+configure_file(late.txt Mutable/late.txt COPYONLY)
+_iplug_add_resources(Deferred "${CMAKE_CURRENT_BINARY_DIR}/Mutable/late.txt")
 iplug_deploy_target(Deferred CLAP Deferred)
 
 _iplug_create_desktop_targets(High "CLAP" "${CMAKE_CURRENT_SOURCE_DIR}/Probe.cpp"
@@ -38,7 +39,8 @@ set_target_properties(Bundled PROPERTIES PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/out/Bundled.vst3/Contents/test-linux")
 set(IPLUG_VST3_DEPLOY_PATH "${CMAKE_BINARY_DIR}/deploy" CACHE PATH "" FORCE)
 target_compile_definitions(Bundled PRIVATE VST3_API)
-_iplug_add_resources(Bundled "${CMAKE_CURRENT_SOURCE_DIR}/Bundled/late.txt")
+configure_file(Bundled/late.txt Bundled/late.txt COPYONLY)
+_iplug_add_resources(Bundled "${CMAKE_CURRENT_BINARY_DIR}/Bundled/late.txt")
 iplug_deploy_target(Bundled VST3 Bundled)
 
 foreach(target Alpha-clap Beta-clap Bundled)
