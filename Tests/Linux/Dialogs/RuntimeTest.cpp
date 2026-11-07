@@ -605,8 +605,15 @@ static void TestFocus()
     event.xbutton.type = ButtonRelease;
     XSendEvent(host, editor, 0, ButtonReleaseMask, &event);
     XSync(host, 0);
-    graphics.ProcessX11Events();
-    XGetInputFocus(host, &focus, &revert);
+    const auto focusDeadline = Clock::now() + std::chrono::seconds(2);
+    do
+    {
+      graphics.ProcessX11Events();
+      XGetInputFocus(host, &focus, &revert);
+      if (focus == editor)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (Clock::now() < focusDeadline);
     Check(focus == editor, "click transfers keyboard focus from host sibling to editor");
     event = {};
     event.xkey.type = KeyPress;

@@ -119,9 +119,22 @@ static void CheckEmbedding(Display* display, Window editor, HWND container, bool
   Check(parent == GDK_WINDOW_XID(native), "bridge belongs to the expected SWELL native ancestor");
 
   RECT client;
-  GetClientRect(container, &client);
   XWindowAttributes attributes {};
-  Check(XGetWindowAttributes(display, bridge, &attributes), "query bridge geometry");
+  // GDK updates the bridge on its own X11 connection. Wait for the requested
+  // geometry rather than assuming a fixed Pump() duration also orders replies
+  // on this independent test connection (especially under CPU emulation).
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  bool queried = false;
+  do
+  {
+    GetClientRect(container, &client);
+    queried = XGetWindowAttributes(display, bridge, &attributes);
+    if (queried && attributes.width == client.right - client.left &&
+        attributes.height == client.bottom - client.top)
+      break;
+    Pump(10);
+  } while (std::chrono::steady_clock::now() < deadline);
+  Check(queried, "query bridge geometry");
   Check(attributes.width == client.right - client.left &&
         attributes.height == client.bottom - client.top, "bridge fills the container client area");
   Check(attributes.map_state == IsViewable, "bridge is visible");

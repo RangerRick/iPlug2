@@ -893,8 +893,8 @@ jobs:
           - label: clang-sanitizers
             name: Linux (Ninja, Clang sanitizers)
             runner: ubuntu-22.04
-            cc: clang
-            cxx: clang++
+            cc: clang-14
+            cxx: clang++-14
             sanitizers: true
     runs-on: ${{ matrix.runner }}
     env:
@@ -941,7 +941,7 @@ jobs:
 
       - name: Install Clang sanitizer runtime
         if: matrix.sanitizers
-        run: sudo apt-get install -y --no-install-recommends clang libclang-rt-14-dev
+        run: sudo apt-get install -y --no-install-recommends clang-14 libclang-rt-14-dev
 
       - name: Cache SDKs
         id: cache-sdks
