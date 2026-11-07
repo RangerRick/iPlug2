@@ -543,6 +543,8 @@ static bool gNoIO = false;
 int main(int argc, char** argv)
 {
   SWELL_initargs(&argc, &argv);
+  // Let SWELL forward events to GTK dialogs while retaining its own GDK event handler.
+  SWELL_ExtendedAPI("LOAD_GTK", nullptr);
   SWELL_Internal_PostMessage_Init();
   SWELL_ExtendedAPI("APPNAME", (void*) BUNDLE_NAME);
 
