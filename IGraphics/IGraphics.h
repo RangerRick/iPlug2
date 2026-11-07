@@ -1159,9 +1159,6 @@ public:
   /** @return true if resizing is in process */
   bool GetResizingInProcess() const { return mResizingInProcess; }
 
-  /** Cancel any in-progress corner-resizer drag (e.g. when host takes over resize) */
-  void CancelDragResize() { mResizingInProcess = false; }
-
   /** Enable/disable multi touch, if platform supports it
     * @return \c true if platform supports it */
   bool EnableMultiTouch(bool enable)
@@ -1281,16 +1278,6 @@ private:
 
 #pragma mark - Control management
 public:
-  /** Called on the host UI thread immediately before host-initiated resize so that
-   *  platform implementations can serialise it with the render thread.
-   *  @param physW Physical width the host requested (pixels)
-   *  @param physH Physical height the host requested (pixels)
-   *  Paired with OnEndHostResize(). Default is a no-op. */
-  virtual void OnBeginHostResize(int physW, int physH) {}
-
-  /** Paired release for OnBeginHostResize(). */
-  virtual void OnEndHostResize() {}
-
   /** For all controls, including the "special controls" call a method
    * @param func A std::function to perform on each control */
   void ForAllControlsFunc(IControlFunction func);
@@ -1731,6 +1718,9 @@ public:
   void ClearGestureRegions();
 
 protected:
+  /** Apply the configured drawing-scale limits. */
+  float ConstrainDrawScale(float scale) const { return Clip(scale, mMinScale, mMaxScale); }
+
   /** Drawing API method to load a bitmap, called internally
    * @param fileNameOrResID A CString absolute path or resource ID
    * @param scale Integer to identify the scale of the resource, for multi-scale bitmaps
@@ -1886,7 +1876,13 @@ private:
   bool mResizingInProcess = false;
   bool mLayoutOnResize = false;
   bool mEnableMultiTouch = false;
+  // Native Linux host windows resize the layout unless a mode is explicitly
+  // selected with AttachCornerResizer(), including for docked REAPER editors.
+#ifdef OS_LINUX
+  EUIResizerMode mGUISizeMode = EUIResizerMode::Size;
+#else
   EUIResizerMode mGUISizeMode = EUIResizerMode::Scale;
+#endif
   double mPrevTimestamp = 0.;
   IKeyHandlerFunc mKeyHandlerFunc = nullptr;
   IDisplayTickFunc mDisplayTickFunc = nullptr;

@@ -11,17 +11,23 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <mutex>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <dlfcn.h>
+#include <poll.h>
+#include <cerrno>
+#include <climits>
+#include <limits>
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
 
 // X11 headers first — they define macros (None, Bool, True, False, Status, Complex...)
 // that conflict with C++ identifiers. IGraphicsLinux.h undefines them.
 #include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/Xatom.h>
@@ -44,12 +50,203 @@
 // headers from being re-included.
 #include "IGraphicsLinux.h"
 #include "IGraphicsStructs.h"
+#include "wdlutf8.h"
+
+#if defined APP_API || defined REAPER_EXT_API
+#include "IPlugSWELLTimer.h"
+#endif
 
 using namespace iplug;
 using namespace igraphics;
 
 // Timer interval in microseconds (60 fps = ~16667 us)
 static constexpr int TIMER_INTERVAL_US = 16667;
+
+namespace
+{
+// Match WindowWidth()/WindowHeight() followed by the X11/display-scale conversion.
+double PhysicalWindowDimension(int designDimension, float drawScale, float screenScale)
+{
+  // Probe large candidates without overflowing int; actual window sizes fit in int.
+  const float logical = std::trunc(designDimension * drawScale);
+  return std::trunc(logical * screenScale);
+}
+
+class LinuxClipboard
+{
+public:
+  ~LinuxClipboard()
+  {
+    mRunning = false;
+    if (mThread)
+      pthread_join(mThread, nullptr);
+    if (mDisplay)
+    {
+      XDestroyWindow(mDisplay, mWindow);
+      XCloseDisplay(mDisplay);
+    }
+  }
+
+  bool SetText(const char* text, const char* displayName)
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (!mDisplay)
+    {
+      mDisplay = XOpenDisplay(displayName);
+      if (!mDisplay)
+      {
+        fprintf(stderr, "Could not open the X11 clipboard display\n");
+        return false;
+      }
+      mConnection = XGetXCBConnection(mDisplay);
+      if (!mConnection)
+      {
+        fprintf(stderr, "Could not access the XCB clipboard connection\n");
+        XCloseDisplay(mDisplay);
+        mDisplay = nullptr;
+        return false;
+      }
+      mWindow = XCreateSimpleWindow(mDisplay, DefaultRootWindow(mDisplay),
+                                    0, 0, 1, 1, 0, 0, 0);
+      mClipboard = XInternAtom(mDisplay, "CLIPBOARD", 0);
+      mUTF8 = XInternAtom(mDisplay, "UTF8_STRING", 0);
+      mTargets = XInternAtom(mDisplay, "TARGETS", 0);
+      mRunning = true;
+      const int error = pthread_create(&mThread, nullptr, Run, this);
+      if (error)
+      {
+        fprintf(stderr, "Could not start the X11 clipboard service: %s\n", strerror(error));
+        mRunning = false;
+        mThread = 0;
+        XDestroyWindow(mDisplay, mWindow);
+        XCloseDisplay(mDisplay);
+        mDisplay = nullptr;
+        mConnection = nullptr;
+        return false;
+      }
+    }
+    if (strcmp(DisplayString(mDisplay), displayName) != 0)
+    {
+      fprintf(stderr, "The clipboard service is already connected to another X11 display\n");
+      return false;
+    }
+    mText.Set(text);
+    XSetSelectionOwner(mDisplay, mClipboard, mWindow, 0);
+    XSync(mDisplay, 0);
+    return XGetSelectionOwner(mDisplay, mClipboard) == mWindow;
+  }
+
+  bool GetOwnedText(Window owner, const char* displayName, WDL_String& text)
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (!mDisplay || owner != mWindow || strcmp(DisplayString(mDisplay), displayName) != 0)
+      return false;
+    text.Set(mText.Get());
+    return true;
+  }
+
+private:
+  static void* Run(void* context)
+  {
+    auto* self = static_cast<LinuxClipboard*>(context);
+    while (self->mRunning)
+    {
+      {
+        std::lock_guard<std::mutex> lock(self->mMutex);
+        while (XPending(self->mDisplay))
+        {
+          XEvent event;
+          XNextEvent(self->mDisplay, &event);
+          if (event.type == SelectionRequest)
+            self->Reply(event.xselectionrequest);
+          else if (event.type == SelectionClear &&
+                   XGetSelectionOwner(self->mDisplay, self->mClipboard) != self->mWindow)
+            self->mText.Set("");
+        }
+      }
+      pollfd fd {XConnectionNumber(self->mDisplay), POLLIN, 0};
+      const int result = poll(&fd, 1, 20);
+      if (result < 0 && errno != EINTR)
+      {
+        fprintf(stderr, "Could not poll the X11 clipboard display: %s\n", strerror(errno));
+        break;
+      }
+    }
+    return nullptr;
+  }
+
+  void Reply(const XSelectionRequestEvent& request)
+  {
+    XFlush(mDisplay);
+    xcb_selection_notify_event_t response {};
+    response.response_type = XCB_SELECTION_NOTIFY;
+    response.requestor = request.requestor;
+    response.selection = request.selection;
+    response.target = request.target;
+    response.time = request.time;
+    const Atom property = request.property ? request.property : request.target;
+    if (request.target == mTargets)
+    {
+      const xcb_atom_t targets[] = {static_cast<xcb_atom_t>(mTargets),
+                                   static_cast<xcb_atom_t>(mUTF8), XCB_ATOM_STRING};
+      if (!CheckReply(xcb_change_property_checked(mConnection, XCB_PROP_MODE_REPLACE,
+                          request.requestor, property, XCB_ATOM_ATOM, 32, 3, targets),
+                      "property write"))
+        return;
+      response.property = property;
+    }
+    else if (request.target == mUTF8 || request.target == XA_STRING)
+    {
+      if (!CheckReply(xcb_change_property_checked(mConnection, XCB_PROP_MODE_REPLACE,
+                          request.requestor, property, request.target, 8,
+                          mText.GetLength(), mText.Get()), "property write"))
+        return;
+      response.property = property;
+    }
+    char event[32] {};
+    static_assert(sizeof(response) <= sizeof(event), "X11 selection event must fit the wire event");
+    memcpy(event, &response, sizeof(response));
+    CheckReply(xcb_send_event_checked(mConnection, 0, request.requestor, XCB_EVENT_MASK_NO_EVENT, event),
+               "selection notification");
+  }
+
+  bool CheckReply(xcb_void_cookie_t cookie, const char* operation)
+  {
+    xcb_generic_error_t* error = xcb_request_check(mConnection, cookie);
+    if (error)
+    {
+      fprintf(stderr, "X11 clipboard %s failed (error %u, resource 0x%x)\n",
+              operation, error->error_code, error->resource_id);
+      free(error);
+      return false;
+    }
+    if (xcb_connection_has_error(mConnection))
+    {
+      fprintf(stderr, "The XCB clipboard connection failed during %s\n", operation);
+      return false;
+    }
+    return true;
+  }
+
+  Display* mDisplay = nullptr;
+  xcb_connection_t* mConnection = nullptr;
+  Window mWindow = 0;
+  Atom mClipboard = 0;
+  Atom mUTF8 = 0;
+  Atom mTargets = 0;
+  WDL_String mText;
+  std::mutex mMutex;
+  std::atomic<bool> mRunning {false};
+  pthread_t mThread = 0;
+};
+
+static LinuxClipboard& GetLinuxClipboard()
+{
+  // A separate connection serves selections even while the host UI thread waits for a paste.
+  static LinuxClipboard clipboard;
+  return clipboard;
+}
+}
 
 // ---- Font helpers -----------------------------------------------------------
 
@@ -135,6 +332,7 @@ static constexpr int kGTK_RESPONSE_OK     = -5;
 static constexpr int kGTK_RESPONSE_CANCEL = -6;
 static constexpr int kGTK_RESPONSE_YES    = -8;
 static constexpr int kGTK_RESPONSE_NO     = -9;
+static constexpr int kGTK_RESPONSE_RETRY  = 1;
 
 // GTK file-chooser action codes
 static constexpr int kGTK_FILE_CHOOSER_ACTION_OPEN          = 0;
@@ -142,6 +340,7 @@ static constexpr int kGTK_FILE_CHOOSER_ACTION_SAVE          = 1;
 static constexpr int kGTK_FILE_CHOOSER_ACTION_SELECT_FOLDER = 2;
 
 // GTK button presets used by message dialogs
+static constexpr int kGTK_BUTTONS_NONE      = 0;
 static constexpr int kGTK_BUTTONS_OK        = 1;
 static constexpr int kGTK_BUTTONS_YES_NO    = 4;
 static constexpr int kGTK_BUTTONS_OK_CANCEL = 5;
@@ -160,6 +359,7 @@ struct GTK3
   using fn_main_iteration_do        = int   (*)(int);
   // Dialogs
   using fn_dialog_run               = int   (*)(void*);
+  using fn_dialog_add_button        = void* (*)(void*, const char*, int);
   using fn_widget_destroy           = void  (*)(void*);
   using fn_window_set_title         = void  (*)(void*, const char*);
   // File chooser
@@ -222,6 +422,7 @@ struct GTK3
   fn_events_pending           events_pending           = nullptr;
   fn_main_iteration_do        main_iteration_do        = nullptr;
   fn_dialog_run               dialog_run               = nullptr;
+  fn_dialog_add_button        dialog_add_button        = nullptr;
   fn_widget_destroy           widget_destroy           = nullptr;
   fn_window_set_title         window_set_title         = nullptr;
   fn_file_chooser_dialog_new  file_chooser_dialog_new  = nullptr;
@@ -286,6 +487,7 @@ static GTK3* LoadGTK3()
   LOAD_GTK_SYM(gtk, events_pending);
   LOAD_GTK_SYM(gtk, main_iteration_do);
   LOAD_GTK_SYM(gtk, dialog_run);
+  LOAD_GTK_SYM(gtk, dialog_add_button);
   LOAD_GTK_SYM(gtk, widget_destroy);
   LOAD_GTK_SYM(gtk, window_set_title);
   LOAD_GTK_SYM(gtk, file_chooser_dialog_new);
@@ -368,6 +570,81 @@ static void GtkPresentDialog(GTK3* g, void* dialog)
     g->window_present(dialog);
 }
 
+// Launch a detached external process. Double-forks so the grandchild is
+// reparented to init and the intermediate child is reaped here — neither
+// becomes a zombie. Returns true if the launch was initiated.
+static bool LaunchDetached(const char* program, const char* arg)
+{
+  pid_t pid = fork();
+  if (pid == 0)
+  {
+    pid_t grandchild = fork();
+    if (grandchild == 0)
+    {
+      execlp(program, program, arg, (char*)nullptr);
+      _exit(127);
+    }
+    _exit(grandchild > 0 ? 0 : 1);
+  }
+  if (pid > 0)
+  {
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return true;
+  }
+  return false;
+}
+
+static bool GtkAddFileFilters(GTK3* g, void* dialog, const char* ext)
+{
+  WDL_String extensions(ext ? ext : "");
+  char* context = nullptr;
+  char* token = strtok_r(extensions.Get(), " \t\r\n", &context);
+  if (!token)
+    return true;
+
+  if (!g->file_filter_new || !g->file_filter_add_pattern || !g->file_chooser_add_filter)
+  {
+    fprintf(stderr, "Cannot apply file dialog filters: required GTK functions are unavailable\n");
+    return false;
+  }
+
+  void* filter = g->file_filter_new();
+  if (!filter)
+  {
+    fprintf(stderr, "Could not create the file extension filter\n");
+    return false;
+  }
+  if (g->file_filter_set_name)
+    g->file_filter_set_name(filter, ext);
+  do
+  {
+    WDL_String pattern;
+    if (token[0] == '*')
+      pattern.Set(token);
+    else
+    {
+      pattern.Set("*.");
+      pattern.Append(token[0] == '.' ? token + 1 : token);
+    }
+    g->file_filter_add_pattern(filter, pattern.Get());
+    token = strtok_r(nullptr, " \t\r\n", &context);
+  } while (token);
+  g->file_chooser_add_filter(dialog, filter);
+
+  void* all = g->file_filter_new();
+  if (!all)
+  {
+    fprintf(stderr, "Could not create the all-files filter\n");
+    return false;
+  }
+  if (g->file_filter_set_name)
+    g->file_filter_set_name(all, "All Files");
+  g->file_filter_add_pattern(all, "*");
+  g->file_chooser_add_filter(dialog, all);
+  return true;
+}
+
 // ---- Runtime fontconfig (optional — loaded via dlopen so plugins work without it) ----
 
 // Fontconfig opaque types — only used through function pointers below.
@@ -441,6 +718,9 @@ static Fontconfig* LoadFontconfig()
 IGraphicsLinux::IGraphicsLinux(IGEditorDelegate& dlg, int w, int h, int fps, float scale)
 : IGRAPHICS_DRAW_CLASS(dlg, w, h, fps, scale)
 {
+#if defined VST3_API || defined VST3C_API || defined CLAP_API
+  mHostDriven = true;
+#endif
   // Required before any Xlib calls from multiple threads
   XInitThreads();
 }
@@ -450,10 +730,10 @@ IGraphicsLinux::~IGraphicsLinux()
   CloseWindow();
 }
 
-static int sIgnoreX11Error(Display*, XErrorEvent*) { return 0; }
-
 void* IGraphicsLinux::OpenWindow(void* pParent)
 {
+  StopTimer();
+  mCloseRequested = false;
   mDisplay = XOpenDisplay(nullptr);
   if (!mDisplay)
     return nullptr;
@@ -461,19 +741,37 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   int screen = DefaultScreen(mDisplay);
   Window root = RootWindow(mDisplay, screen);
 
-  // Validate pParent is an actual X11 Window, not a SWELL generic HWND pointer.
-  // In standalone mode the APP host passes gHWND, which is a heap pointer —
-  // XGetWindowAttributes will fail for it and we fall back to root.
   mParentWnd = root;
   if (pParent)
   {
-    XErrorHandler prev = XSetErrorHandler(sIgnoreX11Error);
-    XWindowAttributes wa = {};
-    int ok = XGetWindowAttributes(mDisplay, (Window)(uintptr_t)pParent, &wa);
-    XSync(mDisplay, 0 /* discard=False */);
-    XSetErrorHandler(prev);
-    if (ok)
-      mParentWnd = (Window)(uintptr_t)pParent;
+    auto* connection = XGetXCBConnection(mDisplay);
+    if (!connection)
+    {
+      fprintf(stderr, "Could not access the XCB connection to validate the editor parent\n");
+      XCloseDisplay(mDisplay);
+      mDisplay = nullptr;
+      return nullptr;
+    }
+    const uintptr_t parent = reinterpret_cast<uintptr_t>(pParent);
+    xcb_generic_error_t* error = nullptr;
+    xcb_get_window_attributes_reply_t* attributes = nullptr;
+    if (parent <= UINT32_MAX)
+      attributes = xcb_get_window_attributes_reply(connection,
+        xcb_get_window_attributes(connection, static_cast<xcb_window_t>(parent)), &error);
+    if (attributes && !error)
+      mParentWnd = static_cast<Window>(parent);
+    else
+      fprintf(stderr, "Invalid X11 editor parent 0x%lx; using a top-level window\n",
+              static_cast<unsigned long>(parent));
+    free(attributes);
+    free(error);
+    if (xcb_connection_has_error(connection))
+    {
+      fprintf(stderr, "The XCB connection failed while validating the editor parent\n");
+      XCloseDisplay(mDisplay);
+      mDisplay = nullptr;
+      return nullptr;
+    }
   }
 
   // Detect HiDPI scale factor. The standalone APP sets IPLUG2_SCREEN_SCALE after
@@ -487,7 +785,7 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     const char* s = getenv("IPLUG2_SCREEN_SCALE");
     if (!s) s = getenv("GDK_SCALE");
     if (s) gdkScale = std::clamp(atoi(s), 1, 8);
-    if (gdkScale > 1)
+    if (gdkScale > 1 && !GetDelegate()->HasHostScreenScale())
       SetScreenScale(static_cast<float>(gdkScale));
     // SetScreenScale is safe here: mPlugWnd==0 so PlatformResize skips,
     // and mVG==nullptr so DrawResize skips.
@@ -534,8 +832,6 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     0, vi->depth, InputOutput, vi->visual,
     CWColormap | CWEventMask, &attrs
   );
-  mLastPhysW = physW;
-  mLastPhysH = physH;
   XFree(vi);
 #else
   XSetWindowAttributes attrs = {};
@@ -554,8 +850,6 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     0, CopyFromParent, InputOutput, CopyFromParent,
     CWEventMask | CWBackPixel, &attrs
   );
-  mLastPhysW = physW;
-  mLastPhysH = physH;
 #endif
 
   if (!mPlugWnd)
@@ -576,7 +870,6 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   mWMDeleteMessage  = XInternAtom(mDisplay, "WM_DELETE_WINDOW",  0 /* False */);
   mClipboardAtom    = XInternAtom(mDisplay, "CLIPBOARD",         0 /* False */);
   mUTF8StringAtom   = XInternAtom(mDisplay, "UTF8_STRING",       0 /* False */);
-  mTargetsAtom      = XInternAtom(mDisplay, "TARGETS",           0 /* False */);
   mSelDataAtom      = XInternAtom(mDisplay, "IPLUG2_SEL_DATA",   0 /* False */);
 
   // WM protocols and size hints are only appropriate for top-level windows.
@@ -602,7 +895,20 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   XFlush(mDisplay);
 
 #ifdef IGRAPHICS_GL
-  if (!glXMakeCurrent(mDisplay, mPlugWnd, (GLXContext)mGLContext))
+  bool initialized = false;
+  {
+    ScopedGLContext scopedGLCtx {this};
+    if (glXGetCurrentContext() == mGLContext && glXGetCurrentDrawable() == mPlugWnd)
+    {
+      gladLoadGL();
+      OnViewInitialized(nullptr);
+      GetDelegate()->LayoutUI(this);
+      SetAllControlsDirty();
+      DrawResize();
+      initialized = true;
+    }
+  }
+  if (!initialized)
   {
     DestroyGLContext();
     if (mGLColormap) { XFreeColormap(mDisplay, mGLColormap); mGLColormap = 0; }
@@ -610,14 +916,6 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     XCloseDisplay(mDisplay); mDisplay = nullptr;
     return nullptr;
   }
-  gladLoadGL();
-  // Keep GL context current through OnViewInitialized, LayoutUI, and DrawResize —
-  // NanoVG context creation, font loading, and FBO initialisation all need active GL.
-  OnViewInitialized(nullptr);
-  GetDelegate()->LayoutUI(this);
-  SetAllControlsDirty();
-  DrawResize();
-  glXMakeCurrent(mDisplay, 0, nullptr);
 #else
   OnViewInitialized(nullptr);
   GetDelegate()->LayoutUI(this);
@@ -625,23 +923,33 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   DrawResize();
 #endif
 
+  CreateInputContext();
   GetDelegate()->OnUIOpen();
 
   // Mark dirty so the first timer tick renders immediately, even if no
   // Expose event arrives before the initial frame.
   mNeedsRedraw = true;
-  StartTimer();
+  if (!StartTimer())
+    return nullptr;
 
   return (void*)(uintptr_t)mPlugWnd;
 }
 
 void IGraphicsLinux::CloseWindow()
 {
+  if (IsInPlatformCallback())
+  {
+    RequestWindowClose();
+    return;
+  }
+  StopTimer();
   if (!mDisplay)
     return;
 
-  StopTimer();
-  OnViewDestroyed();
+  {
+    ScopedGLContext scopedGLCtx {this};
+    OnViewDestroyed();
+  }
 
 #ifdef IGRAPHICS_GL
   DestroyGLContext();
@@ -653,6 +961,7 @@ void IGraphicsLinux::CloseWindow()
     mBlankCursor = 0;
   }
 
+  DestroyInputContext();
   if (mPlugWnd)
   {
     XDestroyWindow(mDisplay, mPlugWnd);
@@ -673,14 +982,10 @@ void IGraphicsLinux::CloseWindow()
 
 void IGraphicsLinux::PlatformResize(bool parentHasResized)
 {
-  // When handling a ConfigureNotify or host-driven resize, the X server (or
-  // host) already sized our window. Calling XResizeWindow here would create an
-  // oscillation or fight the host's window manager.
-  if (mInConfigureNotify || mInHostResize || mHostDidResize)
-  {
-    mHostDidResize = false;
+  // When handling a ConfigureNotify, the X server already sized our window.
+  // Calling XResizeWindow here would create an oscillation.
+  if (mInConfigureNotify)
     return;
-  }
 
   if (mDisplay && mPlugWnd)
   {
@@ -688,9 +993,22 @@ void IGraphicsLinux::PlatformResize(bool parentHasResized)
     auto w = (unsigned)(WindowWidth()  * GetScreenScale());
     auto h = (unsigned)(WindowHeight() * GetScreenScale());
     XResizeWindow(mDisplay, mPlugWnd, w, h);
-    mLastPhysW = w;
-    mLastPhysH = h;
   }
+}
+
+void IGraphicsLinux::SetScreenScaleFromHost(float scale)
+{
+  if (scale == GetScreenScale())
+    return;
+  if (mDisplay && mPlugWnd)
+  {
+    // Complete older native resize requests before changing the coordinate
+    // conversion. Their ConfigureNotify events describe the previous scale.
+    XSync(mDisplay, 0);
+    XEvent event;
+    while (XCheckTypedWindowEvent(mDisplay, mPlugWnd, ConfigureNotify, &event)) {}
+  }
+  SetScreenScale(scale);
 }
 
 void IGraphicsLinux::DrawResize()
@@ -699,28 +1017,95 @@ void IGraphicsLinux::DrawResize()
   IGRAPHICS_DRAW_CLASS::DrawResize();
 }
 
-void IGraphicsLinux::OnBeginHostResize(int physW, int physH)
+void IGraphicsLinux::ResizeFromHost(int width, int height)
 {
-  mInHostResize = true;
-  mHostPhysW = static_cast<unsigned>(physW);
-  mHostPhysH = static_cast<unsigned>(physH);
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+  if (width <= 0 || height <= 0)
+    return;
+
+  int designWidth, designHeight;
+  float scale;
+  CalculateHostResize(width, height, designWidth, designHeight, scale);
+  Resize(designWidth, designHeight, scale, false);
 }
 
-void IGraphicsLinux::OnEndHostResize()
+void IGraphicsLinux::CalculateHostResize(int width, int height, int& designWidth, int& designHeight, float& scale)
 {
-  // Resize our X11 window to match the host's requested size exactly.
-  // In Scale mode, WindowWidth()/WindowHeight() may differ from the
-  // host's size due to aspect ratio correction (max(scaleX, scaleY)),
-  // so use the stored host size to avoid oscillation.
-  if (mDisplay && mPlugWnd && mHostPhysW && mHostPhysH)
+  const float screenScale = GetScreenScale();
+  const auto pixels = [screenScale](int dimension, float candidateScale) {
+    return PhysicalWindowDimension(dimension, candidateScale, screenScale);
+  };
+  if (GetResizerMode() == EUIResizerMode::Scale)
   {
-    XResizeWindow(mDisplay, mPlugWnd, mHostPhysW, mHostPhysH);
-    mLastPhysW = mHostPhysW;
-    mLastPhysH = mHostPhysH;
-  }
+    designWidth = Width();
+    designHeight = Height();
+    GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
 
-  mInHostResize = false;
-  mHostDidResize = true;
+    const auto fits = [&](float candidateScale) {
+      return pixels(designWidth, candidateScale) <= width &&
+             pixels(designHeight, candidateScale) <= height;
+    };
+    float lo = ConstrainDrawScale(0.f);
+    float hi = ConstrainDrawScale(std::numeric_limits<float>::max());
+    if (fits(hi))
+      lo = hi;
+    else if (fits(lo))
+    {
+      // Find the last representable scale that fits the requested pixel bounds.
+      // Inverting their lower edges loses a pixel at each integer conversion.
+      // Querying the resulting dimensions admits this same scale again.
+      for (;;)
+      {
+        const float mid = lo + (hi - lo) * .5f;
+        if (mid == lo || mid == hi)
+          break;
+        if (fits(mid))
+          lo = mid;
+        else
+          hi = mid;
+      }
+    }
+    scale = lo;
+    // Keep exact scales such as 1.5 when they produce the same pixel dimensions.
+    const float nominalScale = ConstrainDrawScale(std::min(width / screenScale / designWidth,
+                                                            height / screenScale / designHeight));
+    if (pixels(designWidth, nominalScale) == pixels(designWidth, scale) &&
+        pixels(designHeight, nominalScale) == pixels(designHeight, scale))
+      scale = nominalScale;
+  }
+  else
+  {
+    scale = ConstrainDrawScale(GetDrawScale());
+    // Use the same upper-bound search for integer design pixels in Size mode.
+    const auto fitDimension = [&](int requested, int maximum) {
+      int lo = 0, hi = maximum;
+      while (lo < hi)
+      {
+        const int mid = hi - (hi - lo) / 2;
+        if (pixels(mid, scale) <= requested)
+          lo = mid;
+        else
+          hi = mid - 1;
+      }
+      const int nominal = static_cast<int>(std::lround(std::min<double>(maximum,
+                                                    requested / screenScale / scale)));
+      return pixels(nominal, scale) == pixels(lo, scale) ? nominal : lo;
+    };
+    designWidth = fitDimension(width, GetDelegate()->GetMaxWidth());
+    designHeight = fitDimension(height, GetDelegate()->GetMaxHeight());
+    // Editor constraints describe dimensions before drawing/display scaling.
+    GetDelegate()->ConstrainEditorResize(designWidth, designHeight);
+  }
+}
+
+void IGraphicsLinux::ConstrainHostResize(int& width, int& height)
+{
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+  int designWidth, designHeight;
+  float scale;
+  CalculateHostResize(width, height, designWidth, designHeight, scale);
+  width = static_cast<int>(PhysicalWindowDimension(designWidth, scale, GetScreenScale()));
+  height = static_cast<int>(PhysicalWindowDimension(designHeight, scale, GetScreenScale()));
 }
 
 void IGraphicsLinux::ForceEndUserEdit()
@@ -814,34 +1199,64 @@ void IGraphicsLinux::GetMouseLocation(float& x, float& y) const
   Window root, child;
   int rootX, rootY, winX, winY;
   unsigned int mask;
-  XQueryPointer(mDisplay, mPlugWnd, &root, &child, &rootX, &rootY, &winX, &winY, &mask);
-  x = (float)winX;
-  y = (float)winY;
+  if (!XQueryPointer(mDisplay, mPlugWnd, &root, &child, &rootX, &rootY, &winX, &winY, &mask))
+  {
+    x = y = 0.f;
+    return;
+  }
+  const float scale = GetTotalScale();
+  x = winX / scale;
+  y = winY / scale;
 }
 
 EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* title,
                                              EMsgBoxType type,
                                              IMsgBoxCompletionHandlerFunc completionHandler)
 {
-  GTK3* g = LoadGTK3();
-  if (!g || !g->message_dialog_new)
-  {
+  auto complete = [&](EMsgBoxResult result) {
     if (completionHandler)
-      completionHandler(EMsgBoxResult::kOK);
-    return EMsgBoxResult::kOK;
+      completionHandler(result);
+    return result;
+  };
+  GTK3* g = LoadGTK3();
+  const bool customButtons = type == kMB_YESNOCANCEL || type == kMB_RETRYCANCEL;
+  if (!g || !g->message_dialog_new || (customButtons && !g->dialog_add_button))
+  {
+    fprintf(stderr, "Cannot show message box: required GTK functions are unavailable\n");
+    return complete(kCANCEL);
   }
 
   int gtkMsgType  = kGTK_MESSAGE_INFO;
   int gtkBtnType  = kGTK_BUTTONS_OK;
   switch (type)
   {
+    case kMB_OK:          break;
     case kMB_OKCANCEL:    gtkMsgType = kGTK_MESSAGE_QUESTION; gtkBtnType = kGTK_BUTTONS_OK_CANCEL; break;
     case kMB_YESNO:       gtkMsgType = kGTK_MESSAGE_QUESTION; gtkBtnType = kGTK_BUTTONS_YES_NO;    break;
-    case kMB_YESNOCANCEL: gtkMsgType = kGTK_MESSAGE_QUESTION; gtkBtnType = kGTK_BUTTONS_OK_CANCEL; break;
-    default:              break;
+    case kMB_YESNOCANCEL:
+    case kMB_RETRYCANCEL: gtkMsgType = kGTK_MESSAGE_QUESTION; gtkBtnType = kGTK_BUTTONS_NONE; break;
+    default:
+      fprintf(stderr, "Cannot show message box: unsupported button type %d\n", type);
+      return complete(kCANCEL);
   }
 
-  void* dialog = g->message_dialog_new(nullptr, 0, gtkMsgType, gtkBtnType, "%s", str);
+  void* dialog = g->message_dialog_new(nullptr, 0, gtkMsgType, gtkBtnType, "%s", str ? str : "");
+  if (!dialog)
+  {
+    fprintf(stderr, "Could not create the message box\n");
+    return complete(kCANCEL);
+  }
+  if (type == kMB_YESNOCANCEL)
+  {
+    g->dialog_add_button(dialog, "_Cancel", kGTK_RESPONSE_CANCEL);
+    g->dialog_add_button(dialog, "_No", kGTK_RESPONSE_NO);
+    g->dialog_add_button(dialog, "_Yes", kGTK_RESPONSE_YES);
+  }
+  else if (type == kMB_RETRYCANCEL)
+  {
+    g->dialog_add_button(dialog, "_Cancel", kGTK_RESPONSE_CANCEL);
+    g->dialog_add_button(dialog, "_Retry", kGTK_RESPONSE_RETRY);
+  }
   if (title && g->window_set_title)
     g->window_set_title(dialog, title);
   GtkPresentDialog(g, dialog);
@@ -850,19 +1265,18 @@ EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* title,
   g->widget_destroy(dialog);
   GtkDrainEvents(g);
 
-  EMsgBoxResult result = kOK;
+  EMsgBoxResult result = kCANCEL;
   switch (resp)
   {
     case kGTK_RESPONSE_OK:     result = kOK;     break;
     case kGTK_RESPONSE_YES:    result = kYES;    break;
     case kGTK_RESPONSE_NO:     result = kNO;     break;
     case kGTK_RESPONSE_CANCEL: result = kCANCEL; break;
+    case kGTK_RESPONSE_RETRY:  result = kRETRY;  break;
     default:                   result = kCANCEL; break;
   }
 
-  if (completionHandler)
-    completionHandler(result);
-  return result;
+  return complete(result);
 }
 
 bool IGraphicsLinux::RevealPathInExplorerOrFinder(WDL_String& path, bool select)
@@ -871,29 +1285,31 @@ bool IGraphicsLinux::RevealPathInExplorerOrFinder(WDL_String& path, bool select)
   WDL_String dir(path);
   if (select)
   {
-    char* lastSlash = strrchr(dir.Get(), '/');
-    if (lastSlash)
-      *lastSlash = '\0';
+    // Truncate to the parent dir via WDL_String, not by writing '\0' through
+    // Get() — that desyncs the cached length and is UB on the const buffer.
+    if (strrchr(dir.Get(), '/'))
+      dir.remove_filepart(false);
   }
 
-  pid_t pid = fork();
-  if (pid == 0)
-  {
-    execlp("xdg-open", "xdg-open", dir.Get(), nullptr);
-    _exit(127);
-  }
-  return pid > 0;
+  return LaunchDetached("xdg-open", dir.Get());
 }
 
 void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
                                    EFileAction action, const char* ext,
                                    IFileDialogCompletionHandlerFunc completionHandler)
 {
+  WDL_String outFile, outPath;
+  auto complete = [&]() {
+    fileName.Set(outFile.Get());
+    path.Set(outPath.Get());
+    if (completionHandler)
+      completionHandler(fileName, path);
+  };
   GTK3* g = LoadGTK3();
   if (!g)
   {
-    if (completionHandler)
-      completionHandler(WDL_String{}, WDL_String{});
+    fprintf(stderr, "Cannot show file dialog: GTK is unavailable\n");
+    complete();
     return;
   }
 
@@ -908,20 +1324,18 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
     nullptr
   );
 
-  // Add extension filter
-  if (ext && ext[0] && g->file_filter_new)
+  if (!dialog)
   {
-    void* filter = g->file_filter_new();
-    WDL_String pat("*.");
-    pat.Append(ext);
-    if (g->file_filter_set_name)  g->file_filter_set_name(filter, ext);
-    if (g->file_filter_add_pattern) g->file_filter_add_pattern(filter, pat.Get());
-    if (g->file_chooser_add_filter) g->file_chooser_add_filter(dialog, filter);
-
-    void* all = g->file_filter_new();
-    if (g->file_filter_set_name)    g->file_filter_set_name(all, "All Files");
-    if (g->file_filter_add_pattern) g->file_filter_add_pattern(all, "*");
-    if (g->file_chooser_add_filter) g->file_chooser_add_filter(dialog, all);
+    fprintf(stderr, "Could not create the file dialog\n");
+    complete();
+    return;
+  }
+  if (!GtkAddFileFilters(g, dialog, ext))
+  {
+    g->widget_destroy(dialog);
+    GtkDrainEvents(g);
+    complete();
+    return;
   }
 
   // Set initial directory
@@ -933,7 +1347,6 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
     g->file_chooser_set_current_name(dialog, fileName.Get());
   GtkPresentDialog(g, dialog);
 
-  WDL_String outFile, outPath;
   if (g->dialog_run(dialog) == kGTK_RESPONSE_OK)
   {
     char* chosen = g->file_chooser_get_filename(dialog);
@@ -945,23 +1358,30 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
         outPath.Set(chosen, (int)(slash - chosen + 1));
       free(chosen);
     }
+    else
+      fprintf(stderr, "File dialog accepted without a selected file\n");
   }
 
   g->widget_destroy(dialog);
   GtkDrainEvents(g);
 
-  if (completionHandler)
-    completionHandler(outFile, outPath);
+  complete();
 }
 
 void IGraphicsLinux::PromptForDirectory(WDL_String& dir,
                                         IFileDialogCompletionHandlerFunc completionHandler)
 {
+  WDL_String outDir;
+  auto complete = [&]() {
+    dir.Set(outDir.Get());
+    if (completionHandler)
+      completionHandler(WDL_String{}, dir);
+  };
   GTK3* g = LoadGTK3();
   if (!g)
   {
-    if (completionHandler)
-      completionHandler(WDL_String{}, WDL_String{});
+    fprintf(stderr, "Cannot show directory dialog: GTK is unavailable\n");
+    complete();
     return;
   }
 
@@ -972,26 +1392,35 @@ void IGraphicsLinux::PromptForDirectory(WDL_String& dir,
     nullptr
   );
 
+  if (!dialog)
+  {
+    fprintf(stderr, "Could not create the directory dialog\n");
+    complete();
+    return;
+  }
+
   if (dir.GetLength() && g->file_chooser_set_current_folder)
     g->file_chooser_set_current_folder(dialog, dir.Get());
   GtkPresentDialog(g, dialog);
 
-  WDL_String outDir;
   if (g->dialog_run(dialog) == kGTK_RESPONSE_OK)
   {
     char* chosen = g->file_chooser_get_filename(dialog);
     if (chosen)
     {
       outDir.Set(chosen);
+      if (outDir.GetLength() && outDir.Get()[outDir.GetLength() - 1] != '/')
+        outDir.Append("/");
       free(chosen);
     }
+    else
+      fprintf(stderr, "Directory dialog accepted without a selected directory\n");
   }
 
   g->widget_destroy(dialog);
   GtkDrainEvents(g);
 
-  if (completionHandler)
-    completionHandler(outDir, WDL_String{});
+  complete();
 }
 
 bool IGraphicsLinux::PromptForColor(IColor& color, const char* str,
@@ -1032,28 +1461,39 @@ bool IGraphicsLinux::PromptForColor(IColor& color, const char* str,
 
 bool IGraphicsLinux::OpenURL(const char* url, const char* msgWindowTitle, const char* confirmMsg, const char* errMsgOnFailure)
 {
-  pid_t pid = fork();
-  if (pid == 0)
-  {
-    execlp("xdg-open", "xdg-open", url, nullptr);
-    _exit(127);
-  }
-  return pid > 0;
+  return LaunchDetached("xdg-open", url);
 }
 
 bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
 {
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
   if (!mDisplay || !mPlugWnd || !mClipboardAtom)
     return false;
+
+  const Window owner = XGetSelectionOwner(mDisplay, mClipboardAtom);
+  if (GetLinuxClipboard().GetOwnedText(owner, DisplayString(mDisplay), str))
+    return true;
+  if (!owner)
+    return false;
+
+  // Native clipboard owners in the host may need the same GTK main thread to
+  // answer. Like modal dialogs, this wait can reenter host callbacks: defer any
+  // editor teardown until the synchronous paste has returned to its caller.
+  DispatchScope dispatch(mDispatchDepth);
+  GTK3* gtk = LoadGTK3();
 
   // Ask the clipboard owner to convert to UTF-8 and store in our scratch property
   XConvertSelection(mDisplay, mClipboardAtom, mUTF8StringAtom, mSelDataAtom,
                     mPlugWnd, 0L /* CurrentTime */);
   XFlush(mDisplay);
 
-  // Poll up to 500 ms; the timer thread processes SelectionNotify for us
+  // Keep the event consumer locked out until we have read SelectionNotify.
   for (int i = 0; i < 50; ++i)
   {
+    if (gtk && gtk->events_pending && gtk->main_iteration_do && gtk->events_pending())
+      gtk->main_iteration_do(0);
+    if (mCloseRequested)
+      return false;
     usleep(10000); // 10 ms
 
     XEvent ev;
@@ -1070,13 +1510,14 @@ bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
       unsigned long nitems, remaining;
       unsigned char* data = nullptr;
 
-      XGetWindowProperty(mDisplay, mPlugWnd, mSelDataAtom,
+      const int status = XGetWindowProperty(mDisplay, mPlugWnd, mSelDataAtom,
                          0, 65536, 1 /* delete after read */,
                          AnyPropertyType, &type, &fmt,
                          &nitems, &remaining, &data);
       // Require remaining == 0 so we never report success on a truncated
       // read, and bound nitems before the int cast to avoid UB.
-      if (data && nitems > 0 && remaining == 0 && nitems <= 0x7FFFFFFFUL)
+      if (status == 0 && fmt == 8 && (type == mUTF8StringAtom || type == XA_STRING) &&
+          data && remaining == 0 && nitems <= 0x7FFFFFFFUL)
       {
         str.Set((const char*)data, (int)nitems);
         XFree(data);
@@ -1086,18 +1527,17 @@ bool IGraphicsLinux::GetTextFromClipboard(WDL_String& str)
       return false;
     }
   }
+  fprintf(stderr, "Timed out waiting for the X11 clipboard owner\n");
   return false;
 }
 
 bool IGraphicsLinux::SetTextInClipboard(const char* str)
 {
+  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
   if (!mDisplay || !mPlugWnd || !mClipboardAtom)
     return false;
 
-  mClipboardText.Set(str);
-  XSetSelectionOwner(mDisplay, mClipboardAtom, mPlugWnd, 0L /* CurrentTime */);
-  XFlush(mDisplay);
-  return XGetSelectionOwner(mDisplay, mClipboardAtom) == mPlugWnd;
+  return GetLinuxClipboard().SetText(str, DisplayString(mDisplay));
 }
 
 // State passed through GTK menu-item activation callbacks.
@@ -1391,16 +1831,28 @@ void IGraphicsLinux::CachePlatformFont(const char* fontID, const PlatformFontPtr
 void IGraphicsLinux::ActivateGLContext()
 {
 #ifdef IGRAPHICS_GL
+  mGLContextStack.push_back({glXGetCurrentDisplay(), glXGetCurrentContext(),
+                            glXGetCurrentDrawable(), glXGetCurrentReadDrawable()});
   if (!mDisplay || !mGLContext) return;
-  glXMakeCurrent(mDisplay, mPlugWnd, (GLXContext)mGLContext);
+  if (!glXMakeCurrent(mDisplay, mPlugWnd, (GLXContext)mGLContext))
+    fprintf(stderr, "Could not activate the Linux graphics GLX context\n");
 #endif
 }
 
 void IGraphicsLinux::DeactivateGLContext()
 {
 #ifdef IGRAPHICS_GL
-  if (!mDisplay) return;
-  glXMakeCurrent(mDisplay, 0, nullptr);
+  assert(!mGLContextStack.empty());
+  const auto state = mGLContextStack.back();
+  mGLContextStack.pop_back();
+  if (glXGetCurrentDisplay() == state.display && glXGetCurrentContext() == state.context &&
+      glXGetCurrentDrawable() == state.drawable && glXGetCurrentReadDrawable() == state.readDrawable)
+    return;
+
+  Display* display = state.context ? state.display : glXGetCurrentDisplay();
+  if (display && !glXMakeContextCurrent(display, state.drawable, state.readDrawable,
+                                       static_cast<GLXContext>(state.context)))
+    fprintf(stderr, "Could not restore the previous GLX context\n");
 #endif
 }
 
@@ -1440,7 +1892,9 @@ void IGraphicsLinux::DestroyGLContext()
 {
   if (mDisplay && mGLContext)
   {
-    glXMakeCurrent(mDisplay, 0, nullptr);
+    if (glXGetCurrentContext() == mGLContext)
+      if (!glXMakeCurrent(mDisplay, 0, nullptr))
+        fprintf(stderr, "Could not release the Linux graphics GLX context\n");
     glXDestroyContext(mDisplay, (GLXContext)mGLContext);
     mGLContext = nullptr;
   }
@@ -1494,18 +1948,173 @@ static int KeysymToVK(KeySym ks)
   }
 }
 
+void IGraphicsLinux::CreateInputContext()
+{
+  // Use the host's locale/modifiers; changing them here would affect every plugin.
+  mInputMethod = XOpenIM(mDisplay, nullptr, nullptr, nullptr);
+  if (mInputMethod)
+  {
+    XIMCallback destroyed {};
+    destroyed.client_data = reinterpret_cast<XPointer>(this);
+    destroyed.callback = [](XIM, XPointer data, XPointer) {
+      auto* graphics = reinterpret_cast<IGraphicsLinux*>(data);
+      graphics->mInputContext = nullptr;
+      graphics->mInputMethod = nullptr;
+      fprintf(stderr, "The Linux input method disconnected; Compose and IME input are unavailable\n");
+    };
+    if (XSetIMValues(mInputMethod, XNDestroyCallback, &destroyed, nullptr))
+    {
+      fprintf(stderr, "Could not register the Linux input method disconnect callback; Compose and IME input are unavailable\n");
+      DestroyInputContext();
+      return;
+    }
+    mInputContext = XCreateIC(mInputMethod,
+      XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+      XNClientWindow, mPlugWnd, XNFocusWindow, mPlugWnd, nullptr);
+  }
+  if (!mInputContext)
+  {
+    fprintf(stderr, "Could not create the Linux input context; Compose and IME input are unavailable\n");
+    DestroyInputContext();
+    return;
+  }
+  long filterEvents = 0;
+  if (XGetICValues(mInputContext, XNFilterEvents, &filterEvents, nullptr) == nullptr)
+  {
+    XWindowAttributes attributes {};
+    if (XGetWindowAttributes(mDisplay, mPlugWnd, &attributes))
+      XSelectInput(mDisplay, mPlugWnd, attributes.your_event_mask | filterEvents);
+  }
+}
+
+void IGraphicsLinux::DestroyInputContext()
+{
+  if (mInputContext)
+  {
+    XDestroyIC(mInputContext);
+    mInputContext = nullptr;
+  }
+  if (mInputMethod)
+  {
+    XCloseIM(mInputMethod);
+    mInputMethod = nullptr;
+  }
+}
+
+void IGraphicsLinux::DispatchKeyEvent(XKeyEvent& event)
+{
+  KeySym symbol = 0;
+  WDL_TypedBuf<char> text;
+  text.Resize(64);
+  if (!text.Get())
+  {
+    fprintf(stderr, "Could not allocate the Linux keyboard input buffer\n");
+    return;
+  }
+  int length = 0;
+  if (event.type == KeyPress && mInputContext)
+  {
+    int status = 0;
+    length = Xutf8LookupString(mInputContext, &event, text.Get(), text.GetSize() - 1, &symbol, &status);
+    if (status == XBufferOverflow && length > 0 && length < INT_MAX)
+    {
+      text.Resize(length + 1);
+      if (text.GetSize() != length + 1)
+      {
+        fprintf(stderr, "Could not allocate the Linux input method commit buffer\n");
+        return;
+      }
+      length = Xutf8LookupString(mInputContext, &event, text.Get(), text.GetSize() - 1, &symbol, &status);
+    }
+    if (status != XLookupChars && status != XLookupKeySym && status != XLookupBoth)
+    {
+      if (status != XLookupNone)
+        fprintf(stderr, "Could not read the Linux input method commit (status %d)\n", status);
+      return;
+    }
+    if (status == XLookupChars)
+      symbol = 0;
+    if (status == XLookupKeySym)
+      length = 0;
+  }
+  else
+  {
+    // Key releases cannot use Xutf8LookupString. Encode printable keysyms rather
+    // than assuming XLookupString's locale-dependent bytes are Latin-1 or UTF-8.
+    length = XLookupString(&event, text.Get(), text.GetSize() - 1, &symbol, nullptr);
+    const bool ascii = length == 1 && static_cast<unsigned char>(text.Get()[0]) < 0x80;
+    if (!ascii && symbol >= 0xA0 && symbol <= 0xFF)
+      length = wdl_utf8_makechar(static_cast<int>(symbol), text.Get(), text.GetSize() - 1);
+    else if (!ascii && (symbol & 0xFF000000UL) == 0x01000000UL)
+    {
+      const auto codepoint = static_cast<int>(symbol & 0xFFFFFFUL);
+      if (codepoint <= 0x10FFFF && !(codepoint >= 0xD800 && codepoint <= 0xDFFF))
+        length = wdl_utf8_makechar(codepoint, text.Get(), text.GetSize() - 1);
+    }
+  }
+  if (length < 0 || length >= text.GetSize())
+  {
+    fprintf(stderr, "Invalid Linux input method commit length %d\n", length);
+    return;
+  }
+  text.Get()[length] = '\0';
+  // A phrase commit can accompany the Return keysym used to accept an IME candidate.
+  if (length > 1)
+    symbol = 0;
+
+  int offset = 0;
+  do
+  {
+    char character[5] {};
+    int size = 0;
+    if (offset < length)
+    {
+      int codepoint = 0;
+      size = wdl_utf8_parsechar(text.Get() + offset, &codepoint);
+      char encoded[4] {};
+      if (size > 4 || offset + size > length || codepoint > 0x10FFFF ||
+          (codepoint >= 0xD800 && codepoint <= 0xDFFF) ||
+          wdl_utf8_makechar(codepoint, encoded, sizeof(encoded)) != size ||
+          memcmp(encoded, text.Get() + offset, size) != 0)
+      {
+        fprintf(stderr, "The Linux input method returned invalid UTF-8\n");
+        return;
+      }
+      memcpy(character, text.Get() + offset, size);
+    }
+    // IKeyPress holds one UTF-8 code point, while an IME can commit an entire phrase.
+    IKeyPress key(character, offset == 0 ? KeysymToVK(symbol) : kVK_NONE,
+                  (event.state & ShiftMask) != 0, (event.state & ControlMask) != 0,
+                  (event.state & Mod1Mask) != 0);
+    if (event.type == KeyPress)
+      OnKeyDown(mCursorX, mCursorY, key);
+    else
+      OnKeyUp(mCursorX, mCursorY, key);
+    offset += size;
+  } while (offset < length && !mCloseRequested);
+}
+
 void IGraphicsLinux::ProcessX11Events()
 {
-  if (!mDisplay || !mPlugWnd)
+  if (IsInPlatformCallback())
+    return;
+  DispatchScope dispatch(mDispatchDepth);
+  DispatchX11Events();
+}
+
+void IGraphicsLinux::DispatchX11Events()
+{
+  if (!mDisplay || !mPlugWnd || mCloseRequested)
     return;
 
-  const float scale = GetTotalScale();
-
-  while (XPending(mDisplay))
+  while (!mCloseRequested && XPending(mDisplay))
   {
     XEvent ev;
     XNextEvent(mDisplay, &ev);
+    if (XFilterEvent(&ev, mPlugWnd))
+      continue;
 
+    const float scale = GetTotalScale();
     switch (ev.type)
     {
       case Expose:
@@ -1537,11 +2146,6 @@ void IGraphicsLinux::ProcessX11Events()
           }
         }
 
-        // Update tracking to the actual X11 window size.
-        mLastPhysW = (unsigned)ce.width;
-        mLastPhysH = (unsigned)ce.height;
-
-        const float ss = GetScreenScale();
         const int physW = ce.width;
         const int physH = ce.height;
         // Check if the internal state already matches this physical
@@ -1559,25 +2163,14 @@ void IGraphicsLinux::ProcessX11Events()
         // avoid a resize oscillation.
         mInConfigureNotify = true;
 
-        if (GetResizerMode() == EUIResizerMode::Scale)
-        {
-          // Scale mode: keep logical dimensions, adjust drawScale
-          const int logW = Width();
-          const int logH = Height();
-          const float scaleX = static_cast<float>(physW) / (logW * ss);
-          const float scaleY = static_cast<float>(physH) / (logH * ss);
-          const float newScale = std::max(scaleX, scaleY);
-          Resize(logW, logH, newScale, false);
-        }
-        else
-        {
-          // Size mode: physical pixels to logical
-          const int w = static_cast<int>(physW / ss);
-          const int h = static_cast<int>(physH / ss);
-          Resize(w, h, 1.0f, false);
-        }
+        ResizeFromHost(physW, physH);
 
         mInConfigureNotify = false;
+        // A WM may ignore the aspect ratio or scale limits. Reconcile the child
+        // once; the resulting ConfigureNotify already matches our state.
+        if (physW != static_cast<int>(WindowWidth() * GetScreenScale()) ||
+            physH != static_cast<int>(WindowHeight() * GetScreenScale()))
+          PlatformResize(false);
         break;
       }
 
@@ -1596,6 +2189,7 @@ void IGraphicsLinux::ProcessX11Events()
           // Scroll wheel — only fire on press
           if (ev.type == ButtonPress)
           {
+            XSetInputFocus(mDisplay, mPlugWnd, RevertToParent, be.time);
             const float delta = (be.button == Button4) ? 1.f : -1.f;
             IMouseMod mod(false, false, shift, ctrl, alt);
             OnMouseWheel(x, y, mod, delta);
@@ -1621,9 +2215,19 @@ void IGraphicsLinux::ProcessX11Events()
 
         if (ev.type == ButtonPress)
         {
-          // X11 has no native double-click event; detect via timestamp.
+          // A child of the host's window does not gain focus automatically.
+          // Only an explicit click transfers focus; mapping/hovering never does.
+          XSetInputFocus(mDisplay, mPlugWnd, RevertToParent, be.time);
+          XFlush(mDisplay);
+          // Measure distance in screen-logical pixels, independent of UI zoom.
           static constexpr unsigned long kDblClickTimeoutMs = 400;
-          if (left && (be.time - mLastLeftClickTime) < kDblClickTimeoutMs)
+          static constexpr float kDblClickDistance = 4.f;
+          const float clickX = be.x / GetScreenScale();
+          const float clickY = be.y / GetScreenScale();
+          if (left && mLastLeftClickTime &&
+              static_cast<uint32_t>(be.time - mLastLeftClickTime) < kDblClickTimeoutMs &&
+              std::fabs(clickX - mLastLeftClickX) <= kDblClickDistance &&
+              std::fabs(clickY - mLastLeftClickY) <= kDblClickDistance)
           {
             OnMouseDblClick(x, y, mod);
             mLastLeftClickTime = 0;  // reset so triple-click doesn't fire again
@@ -1631,8 +2235,9 @@ void IGraphicsLinux::ProcessX11Events()
           else
           {
             OnMouseDown(list);
-            if (left)
-              mLastLeftClickTime = be.time;
+            mLastLeftClickTime = left ? be.time : 0;
+            mLastLeftClickX = clickX;
+            mLastLeftClickY = clickY;
           }
         }
         else
@@ -1681,76 +2286,32 @@ void IGraphicsLinux::ProcessX11Events()
         OnMouseOut();
         break;
 
+      case FocusIn:
+        if (mInputContext)
+          XSetICFocus(mInputContext);
+        break;
+
+      case FocusOut:
+        if (mInputContext)
+          XUnsetICFocus(mInputContext);
+        break;
+
       case KeyPress:
       case KeyRelease:
-      {
-        XKeyEvent& ke = ev.xkey;
-        char buf[8] = {};
-        KeySym ks = 0;
-        XLookupString(&ke, buf, sizeof(buf) - 1, &ks, nullptr);
-
-        const bool shift = (ke.state & ShiftMask)   != 0;
-        const bool ctrl  = (ke.state & ControlMask) != 0;
-        const bool alt   = (ke.state & Mod1Mask)    != 0;
-
-        IKeyPress keyPress(buf, KeysymToVK(ks), shift, ctrl, alt);
-        const float mx = mCursorX;
-        const float my = mCursorY;
-
-        if (ev.type == KeyPress)
-          OnKeyDown(mx, my, keyPress);
-        else
-          OnKeyUp(mx, my, keyPress);
+        DispatchKeyEvent(ev.xkey);
         break;
-      }
 
       case ClientMessage:
       {
-        if ((Atom)ev.xclient.data.l[0] == mWMDeleteMessage)
-          CloseWindow();
+        if (ev.xclient.message_type == XInternAtom(mDisplay, "WM_PROTOCOLS", 0) &&
+            ev.xclient.format == 32 && (Atom)ev.xclient.data.l[0] == mWMDeleteMessage)
+        {
+          mCloseRequested = true;
+          mTimerRunning = false;
+          return;
+        }
         break;
       }
-
-      // Another app is asking us to hand over our clipboard contents
-      case SelectionRequest:
-      {
-        XSelectionRequestEvent& req = ev.xselectionrequest;
-        XEvent resp = {};
-        resp.xselection.type      = SelectionNotify;
-        resp.xselection.display   = mDisplay;
-        resp.xselection.requestor = req.requestor;
-        resp.xselection.selection = req.selection;
-        resp.xselection.target    = req.target;
-        resp.xselection.time      = req.time;
-
-        if (req.target == mTargetsAtom)
-        {
-          Atom targets[] = { mTargetsAtom, mUTF8StringAtom, XA_STRING };
-          XChangeProperty(mDisplay, req.requestor, req.property, XA_ATOM, 32,
-                          PropModeReplace, (unsigned char*)targets, 3);
-          resp.xselection.property = req.property;
-        }
-        else if (req.target == mUTF8StringAtom || req.target == XA_STRING)
-        {
-          XChangeProperty(mDisplay, req.requestor, req.property, req.target, 8,
-                          PropModeReplace,
-                          (unsigned char*)mClipboardText.Get(),
-                          mClipboardText.GetLength());
-          resp.xselection.property = req.property;
-        }
-        else
-        {
-          resp.xselection.property = 0 /* None */;
-        }
-        XSendEvent(mDisplay, req.requestor, 0 /* False */, 0, &resp);
-        XFlush(mDisplay);
-        break;
-      }
-
-      // We've lost clipboard ownership; discard our stored text
-      case SelectionClear:
-        mClipboardText.Set("");
-        break;
 
       default:
         break;
@@ -1770,19 +2331,42 @@ void* IGraphicsLinux::TimerThreadProc(void* pParam)
   return nullptr;
 }
 
-void IGraphicsLinux::StartTimer()
+bool IGraphicsLinux::StartTimer()
 {
-  if (mHostDriven)
-    return;  // host provides timer/fd callbacks; no internal thread needed
-  if (pthread_create(&mTimerThread, nullptr, TimerThreadProc, this) == 0)
-    mTimerRunning = true;
+  if (mHostDriven || mTimerRunning)
+    return true;
+
+#if defined APP_API || defined REAPER_EXT_API
+  mMainLoopTimer.reset(SWELLTimer::Create([this](Timer&) { OnDisplayTimer(); },
+    std::max(1, 1000 / FPS())));
+  if (!mMainLoopTimer)
+  {
+    fprintf(stderr, "Could not start Linux graphics main-loop timer\n");
+    return false;
+  }
+  mTimerRunning = true;
+  return true;
+#else
+  mTimerRunning = true;
+  const int error = pthread_create(&mTimerThread, nullptr, TimerThreadProc, this);
+  if (error)
+  {
+    mTimerRunning = false;
+    mTimerThread = 0;
+    fprintf(stderr, "Could not start Linux graphics timer: %s\n", strerror(error));
+    return false;
+  }
+
+  return true;
+#endif
 }
 
 void IGraphicsLinux::StopTimer()
 {
-  if (mTimerRunning)
+  mTimerRunning = false;
+  mMainLoopTimer.reset();
+  if (mTimerThread && !pthread_equal(mTimerThread, pthread_self()))
   {
-    mTimerRunning = false;
     pthread_join(mTimerThread, nullptr);
     mTimerThread = 0;
   }
@@ -1790,17 +2374,19 @@ void IGraphicsLinux::StopTimer()
 
 void IGraphicsLinux::OnDisplayTimer()
 {
-  if (!mDisplay || !mPlugWnd)
+  if (IsInPlatformCallback())
+    return;
+  DispatchScope dispatch(mDispatchDepth);
+  // Teardown joins this timer while holding GfxMutex; skip busy frames instead of waiting.
+  std::unique_lock<std::recursive_mutex> lock(GetDelegate()->GfxMutex(), std::try_to_lock);
+  if (!lock.owns_lock())
+    return;
+  if (!mDisplay || !mPlugWnd || mCloseRequested)
     return;
 
-  // Hold the GfxMutex for the entire timer tick so that host-thread calls
-  // (SendParameterValueFromDelegate, CloseWindow, resize, etc.) cannot
-  // concurrently modify IGraphics state while we process events or draw.
-  // The mutex is recursive so ProcessX11Events() -> DrawResize() can
-  // re-enter safely.
-  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
-
-  ProcessX11Events();
+  DispatchX11Events();
+  if (!mDisplay || !mPlugWnd || mCloseRequested)
+    return;
 
   IRECTList rects;
   if (mNeedsRedraw || IsDirty(rects))
@@ -1813,12 +2399,11 @@ void IGraphicsLinux::OnDisplayTimer()
       IRECT full(0, 0, (float)WindowWidth() / scale, (float)WindowHeight() / scale);
       rects.Add(full);
     }
-    ActivateGLContext();
+    ScopedGLContext scopedGLCtx {this};
     Draw(rects);
 #if defined(IGRAPHICS_GL2) || defined(IGRAPHICS_GL3)
     glXSwapBuffers(mDisplay, mPlugWnd);
 #endif
-    DeactivateGLContext();
   }
 }
 

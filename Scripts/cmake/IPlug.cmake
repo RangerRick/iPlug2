@@ -117,12 +117,11 @@ if(NOT TARGET iPlug2::IPlug)
     )
   elseif(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
     # WDL assumes signed char; ARM Linux defaults to unsigned char
-    # Force-include stdlib.h before any translation unit: WDL's heapbuf.h uses
-    # malloc/free/realloc without including stdlib.h itself, and they aren't
-    # pulled in transitively on GCC (unlike Clang on macOS).
+    # Supply allocation declarations and the legacy byte-swap names used by
+    # WDL on Linux/Clang, without patching the third-party headers.
     target_compile_options(iPlug2::IPlug INTERFACE
       -fsigned-char
-      -include stdlib.h
+      -include "${IPLUG_DIR}/IPlugLinuxHeaders.h"
       # VST2/FXP preset magic uses multi-character character constants ('CcnK', 'FxCk', etc.)
       # intentionally — these are 4CC codes, not programmer errors.
       -Wno-multichar
@@ -231,7 +230,7 @@ if(NOT TARGET iPlug2_Extras_IWebViewControl_obj)
   endif()
 endif()
 
-if(NOT TARGET iPlug2::Extras::IWebViewControl)
+if(NOT TARGET iPlug2::Extras::IWebViewControl AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(iPlug2::Extras::IWebViewControl INTERFACE IMPORTED)
 
   if(WIN32)
@@ -294,10 +293,6 @@ if(NOT TARGET iPlug2::Extras::IWebViewControl)
   elseif(APPLE)
     target_sources(iPlug2::Extras::IWebViewControl INTERFACE
       $<TARGET_OBJECTS:iPlug2_Extras_IWebViewControl_obj>
-    )
-  elseif(UNIX AND NOT APPLE)
-    target_sources(iPlug2::Extras::IWebViewControl INTERFACE
-      ${IPLUG_DIR}/Extras/WebView/IPlugWebView_linux.cpp
     )
   endif()
 
