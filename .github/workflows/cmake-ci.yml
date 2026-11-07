@@ -884,6 +884,12 @@ jobs:
             cc: gcc
             cxx: g++
             sanitizers: false
+          - label: gcc-x64-ubuntu24
+            name: Linux (Ninja, Ubuntu 24.04)
+            runner: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            sanitizers: false
           - label: gcc-arm64
             name: Linux (Ninja, GCC ARM64)
             runner: ubuntu-22.04-arm
