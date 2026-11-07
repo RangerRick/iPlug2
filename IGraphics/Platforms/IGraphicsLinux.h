@@ -106,6 +106,8 @@ public:
 
   void PlatformResize(bool parentHasResized) override;
   void DrawResize() override;
+  /** Apply a new host scale without interpreting older native sizes at the new scale. */
+  void SetScreenScaleFromHost(float scale);
   /** Apply a host/X11 size in physical pixels, preserving the configured resize mode. */
   void ResizeFromHost(int width, int height);
   /** Constrain a proposed host size in physical pixels without resizing the editor. */

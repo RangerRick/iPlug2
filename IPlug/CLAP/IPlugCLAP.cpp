@@ -112,7 +112,7 @@ bool IPlugCLAP::EditorResize(int viewWidth, int viewHeight)
 {
   if (HasUI())
   {
-    if (viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight())
+    if ((viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight()) && GetClapHost().canUseGui())
     {
       GetClapHost().guiRequestResize(viewWidth, viewHeight);
     }
@@ -931,7 +931,11 @@ bool IPlugCLAP::implementsGui() const noexcept
 
 bool IPlugCLAP::guiCreate(const char* api, bool isFloating) noexcept
 {
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+  return HasUI() && guiIsApiSupported(api, isFloating) && PrepareGraphics();
+#else
   return HasUI();
+#endif
 }
 
 void IPlugCLAP::guiDestroy() noexcept
@@ -994,6 +998,9 @@ bool IPlugCLAP::guiCanResize() const noexcept
 
 bool IPlugCLAP::guiSetScale(double scale) noexcept
 {
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+  return HasUI() && SetHostScreenScale(static_cast<float>(scale));
+#else
   if (HasUI())
   {
     SetScreenScale(static_cast<float>(scale));
@@ -1003,6 +1010,7 @@ bool IPlugCLAP::guiSetScale(double scale) noexcept
   {
     return false;
   }
+#endif
 }
 
 bool IPlugCLAP::guiGetSize(uint32_t* pWidth, uint32_t* pHeight) noexcept

@@ -12,6 +12,8 @@
 #include "IGraphics.h"
 #include "IControl.h"
 #include <algorithm>
+#include <cmath>
+#include <climits>
 
 #ifdef OS_LINUX
 #include "IGraphicsLinux.h"
@@ -42,12 +44,17 @@ void* IGEditorDelegate::OpenWindow(void* pParent)
     return nullptr;
   }
 #endif
+#ifdef OS_LINUX
+  if (!PrepareGraphics())
+    return nullptr;
+#else
   if(!mGraphics)
   {
     mGraphics = std::unique_ptr<IGraphics>(CreateGraphics());
     if (mLastWidth && mLastHeight && mLastScale)
       GetUI()->Resize(mLastWidth, mLastHeight, mLastScale);
   }
+#endif
   
   if(mGraphics)
   {
@@ -99,6 +106,38 @@ void IGEditorDelegate::CloseWindow()
 }
 
 #ifdef OS_LINUX
+bool IGEditorDelegate::PrepareGraphics()
+{
+  IPLUG_GFX_LOCK;
+  if (!mGraphics)
+  {
+    mGraphics.reset(CreateGraphics());
+    if (!mGraphics)
+      return false;
+    if (mLastWidth && mLastHeight && mLastScale)
+      mGraphics->Resize(mLastWidth, mLastHeight, mLastScale);
+    if (mHostScreenScale > 0.f)
+      mGraphics->SetScreenScale(mHostScreenScale);
+    SetEditorSize(mGraphics->WindowWidth() * mGraphics->GetScreenScale(),
+                  mGraphics->WindowHeight() * mGraphics->GetScreenScale());
+  }
+  return true;
+}
+
+bool IGEditorDelegate::SetHostScreenScale(float scale)
+{
+  IPLUG_GFX_LOCK;
+  if (!std::isfinite(scale) || scale <= 0.f || !PrepareGraphics())
+    return false;
+  const double width = mGraphics->WindowWidth() * static_cast<double>(scale);
+  const double height = mGraphics->WindowHeight() * static_cast<double>(scale);
+  if (width < 1. || height < 1. || width >= INT_MAX || height >= INT_MAX)
+    return false;
+  mHostScreenScale = scale;
+  static_cast<IGraphicsLinux*>(mGraphics.get())->SetScreenScaleFromHost(scale);
+  return true;
+}
+
 bool IGEditorDelegate::CloseWindowIfRequested()
 {
   IPLUG_GFX_LOCK;
@@ -129,8 +168,12 @@ void IGEditorDelegate::OnParentWindowResize(int width, int height)
 void IGEditorDelegate::SetScreenScale(float scale)
 {
   IPLUG_GFX_LOCK;
+#ifdef OS_LINUX
+  SetHostScreenScale(scale);
+#else
   if (GetUI())
     mGraphics->SetScreenScale(scale);
+#endif
 }
 
 void IGEditorDelegate::SendControlValueFromDelegate(int ctrlTag, double normalizedValue)

@@ -94,6 +94,12 @@ public:
   int UnserializeEditorSize(const IByteChunk& chunk, int startPos);
     
 #ifdef OS_LINUX
+  /** Create the editor model before a host asks for its size, without opening a window. */
+  bool PrepareGraphics();
+  /** Apply and remember an explicit host scale, including before attachment. */
+  bool SetHostScreenScale(float scale);
+  bool HasHostScreenScale() const { return mHostScreenScale > 0.f; }
+
   /** Complete a pending native close on the owner's main thread, outside graphics dispatch. */
   bool CloseWindowIfRequested();
 
@@ -117,6 +123,7 @@ private:
   bool mClosing = false; // used to prevent re-entrancy on closing
 #ifdef OS_LINUX
   mutable std::recursive_mutex mGfxMutex;
+  float mHostScreenScale = 0.f;
 #endif
 };
 

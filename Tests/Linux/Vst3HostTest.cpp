@@ -1,5 +1,7 @@
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
+#include <limits>
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include <atomic>
@@ -281,12 +283,42 @@ int main(int argc, char** argv)
       Check(view != nullptr, "create VST3 view");
       if (!view)
         break;
+      if (strcmp(mode, "scale") == 0)
+      {
+        FUnknownPtr<IPlugViewContentScaleSupport> scale(view);
+        ViewRect size;
+        Check(scale && scale->setContentScaleFactor(1.25f) == kResultOk,
+              "accept scale before frame and attachment");
+        Check(view->getSize(&size) == kResultOk && size.getWidth() == 750 && size.getHeight() == 750,
+              "pre-frame getSize reflects fractional scale");
+        Check(scale->setContentScaleFactor(0.f) != kResultOk &&
+              scale->setContentScaleFactor(std::numeric_limits<float>::quiet_NaN()) != kResultOk,
+              "reject invalid VST3 content scales");
+        Check(setenv("GDK_SCALE", "3", 1) == 0, "test VST3 host scale priority");
+        XResizeWindow(display, parent, 1200, 1200);
+        XSync(display, False);
+      }
       Check(view->setFrame(&frame) == kResultOk, "set VST3 frame");
       const auto result = view->attached(reinterpret_cast<void*>(static_cast<uintptr_t>(parent)),
                                          kPlatformTypeX11EmbedWindowID);
       Check((result == kResultOk) == !expectFailure, "VST3 attach reports actual success or failure");
       if (result == kResultOk)
       {
+        if (strcmp(mode, "scale") == 0)
+        {
+          FUnknownPtr<IPlugViewContentScaleSupport> scale(view);
+          Check(scale->setContentScaleFactor(2.f) == kResultOk, "accept attached scale change");
+          ViewRect size;
+          Check(view->getSize(&size) == kResultOk && size.getWidth() == 1200 && size.getHeight() == 1200,
+                "attached size reflects scale change for a fixed-size editor");
+          frame.Pump();
+          host.Pump();
+          const Window editor = FindEditor(display, parent);
+          XWindowAttributes attributes {};
+          Check(editor && XGetWindowAttributes(display, editor, &attributes) &&
+                attributes.width == 1200 && attributes.height == 1200, "VST3 native size matches scale");
+          unsetenv("GDK_SCALE");
+        }
         if (strcmp(mode, "frame-switch") == 0)
         {
           Check(view->setFrame(&host) == kResultOk, "replace frame while editor is attached");
@@ -304,7 +336,7 @@ int main(int argc, char** argv)
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         Check(rendered, "VST3 editor renders through the host run loop");
-        if (editor && !idleProbe)
+        if (editor && !idleProbe && strcmp(mode, "scale") != 0)
         {
           const unsigned before = host.begins;
           SendGesture(display, editor);

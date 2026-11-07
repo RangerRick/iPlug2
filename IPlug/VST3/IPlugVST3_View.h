@@ -73,9 +73,16 @@ public:
   {
     TRACE
 
-    if (pSize && mOwner.GetHostResizeEnabled())
+    if (pSize && (mOwner.GetHostResizeEnabled()
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+                 || mApplyingContentScale
+#endif
+                 ))
     {
       rect = *pSize;
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+      if (!mApplyingContentScale)
+#endif
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
       return Steinberg::kResultTrue;
     }
@@ -189,6 +196,15 @@ public:
   {
 #ifdef OS_WIN
     mOwner.SetScreenScale(factor);
+#elif defined OS_LINUX && !defined NO_IGRAPHICS
+    // Hosts can supply the scale before setFrame()/attached(). Preparing the
+    // model updates getSize() without calling a frame that does not exist yet.
+    mApplyingContentScale = true;
+    const bool applied = mOwner.HasUI() && mOwner.SetHostScreenScale(factor);
+    mApplyingContentScale = false;
+    return applied ? Steinberg::kResultOk : Steinberg::kResultFalse;
+#elif defined OS_LINUX
+    return Steinberg::kResultFalse;
 #endif
 
     return Steinberg::kResultOk;
@@ -435,13 +451,15 @@ public:
     TRACE
     
     Steinberg::ViewRect newSize = Steinberg::ViewRect(0, 0, w, h);
-    plugFrame->resizeView(this, &newSize);
+    if (plugFrame)
+      plugFrame->resizeView(this, &newSize);
   }
 
   T& mOwner;
 
 #if defined OS_LINUX && !defined NO_IGRAPHICS
 private:
+  bool mApplyingContentScale = false;
   void CheckLinuxWindowClosed()
   {
     auto* graphics = static_cast<iplug::igraphics::IGraphicsLinux*>(mOwner.GetUI());

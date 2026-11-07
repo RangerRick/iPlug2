@@ -48,9 +48,13 @@ if(TARGET IPlugEffect-vst3)
   target_include_directories(LinuxVst3HostTest PRIVATE "${VST3_SDK}" ${X11_INCLUDE_DIR})
   target_link_libraries(LinuxVst3HostTest PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} pthread)
   add_dependencies(LinuxVst3HostTest IPlugEffect-vst3)
-  foreach(mode normal context-loop no-loop timer-fail fd-fail window-fail frame-switch native-close)
+  foreach(mode scale normal context-loop no-loop timer-fail fd-fail window-fail frame-switch native-close)
+    set(scale_screen_args)
+    if(mode STREQUAL "scale")
+      list(APPEND scale_screen_args -s "-screen 0 1600x1600x24")
+    endif()
     add_test(NAME linux-vst3-${mode}
-      COMMAND "${XVFB_RUN}" -a "$<TARGET_FILE:LinuxVst3HostTest>"
+      COMMAND "${XVFB_RUN}" -a ${scale_screen_args} "$<TARGET_FILE:LinuxVst3HostTest>"
         "$<TARGET_FILE:IPlugEffect-vst3>" "${mode}")
     set_tests_properties(linux-vst3-${mode} PROPERTIES TIMEOUT 30
       ENVIRONMENT "LIBGL_ALWAYS_SOFTWARE=1;LD_PRELOAD=$<TARGET_FILE:LinuxStartupHooks>")
@@ -128,10 +132,14 @@ if(TARGET IPlugEffect-clap)
     "${IPLUG2_DIR}/Dependencies/IPlug/CLAP_SDK/include")
   target_link_libraries(LinuxClapHostTest PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} pthread)
   add_dependencies(LinuxClapHostTest IPlugEffect-clap)
-  foreach(mode extensions none timer-only fd-only timer-fail fd-fail both-fail window-fail fallback-fail
+  foreach(mode scale extensions none timer-only fd-only timer-fail fd-fail both-fail window-fail fallback-fail
     native-close native-close-fallback)
+    set(scale_screen_args)
+    if(mode STREQUAL "scale")
+      list(APPEND scale_screen_args -s "-screen 0 1600x1600x24")
+    endif()
     add_test(NAME linux-clap-${mode}
-      COMMAND "${XVFB_RUN}" -a "$<TARGET_FILE:LinuxClapHostTest>"
+      COMMAND "${XVFB_RUN}" -a ${scale_screen_args} "$<TARGET_FILE:LinuxClapHostTest>"
         "$<TARGET_FILE:IPlugEffect-clap>" "${mode}")
     set_tests_properties(linux-clap-${mode} PROPERTIES TIMEOUT 30
       ENVIRONMENT "LIBGL_ALWAYS_SOFTWARE=1;LD_PRELOAD=$<TARGET_FILE:LinuxStartupHooks>")

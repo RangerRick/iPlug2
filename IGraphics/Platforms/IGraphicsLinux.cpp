@@ -785,7 +785,7 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     const char* s = getenv("IPLUG2_SCREEN_SCALE");
     if (!s) s = getenv("GDK_SCALE");
     if (s) gdkScale = std::clamp(atoi(s), 1, 8);
-    if (gdkScale > 1)
+    if (gdkScale > 1 && !GetDelegate()->HasHostScreenScale())
       SetScreenScale(static_cast<float>(gdkScale));
     // SetScreenScale is safe here: mPlugWnd==0 so PlatformResize skips,
     // and mVG==nullptr so DrawResize skips.
@@ -994,6 +994,21 @@ void IGraphicsLinux::PlatformResize(bool parentHasResized)
     auto h = (unsigned)(WindowHeight() * GetScreenScale());
     XResizeWindow(mDisplay, mPlugWnd, w, h);
   }
+}
+
+void IGraphicsLinux::SetScreenScaleFromHost(float scale)
+{
+  if (scale == GetScreenScale())
+    return;
+  if (mDisplay && mPlugWnd)
+  {
+    // Complete older native resize requests before changing the coordinate
+    // conversion. Their ConfigureNotify events describe the previous scale.
+    XSync(mDisplay, 0);
+    XEvent event;
+    while (XCheckTypedWindowEvent(mDisplay, mPlugWnd, ConfigureNotify, &event)) {}
+  }
+  SetScreenScale(scale);
 }
 
 void IGraphicsLinux::DrawResize()

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <limits>
 #include <thread>
 
 #include "X11Test.h"
@@ -291,6 +292,16 @@ int main(int argc, char** argv)
     dlclose(library);
     return sFailures ? 1 : 0;
   }
+  if (mode == "scale")
+  {
+    uint32_t width = 0, height = 0;
+    Check(gui->set_scale(plugin, 2.0), "accept scale before attachment");
+    Check(gui->get_size(plugin, &width, &height) && width == 1200 && height == 1200,
+          "initial size reflects host scale before attachment");
+    Check(!gui->set_scale(plugin, 0.) && !gui->set_scale(plugin, -1.) &&
+          !gui->set_scale(plugin, std::numeric_limits<double>::infinity()), "reject invalid scales");
+    Check(setenv("GDK_SCALE", "3", 1) == 0, "test explicit host scale priority");
+  }
   XInitThreads();
   Display* display = XOpenDisplay(nullptr);
   if (!display)
@@ -303,7 +314,7 @@ int main(int argc, char** argv)
     return 1;
   }
   const Window window = XCreateSimpleWindow(display, DefaultRootWindow(display),
-                                             0, 0, 600, 600, 0, 0, 0);
+                                             0, 0, mode == "scale" ? 1200 : 600, mode == "scale" ? 1200 : 600, 0, 0, 0);
   XMapWindow(display, window);
   XSync(display, False);
   clap_window_t parent {};
@@ -330,6 +341,20 @@ int main(int argc, char** argv)
     for (unsigned i = 0; i < 3; ++i)
     {
       Check(gui->show(plugin), "show attached or recreated GUI");
+      if (mode == "scale")
+      {
+        uint32_t width = 0, height = 0;
+        Check(gui->get_size(plugin, &width, &height) && width == 1200 && height == 1200,
+              "host scale persists across attach and hide/show");
+        const Window editor = FindEditor(display, window);
+        XWindowAttributes attributes {};
+        Check(editor && XGetWindowAttributes(display, editor, &attributes) &&
+              attributes.width == 1200 && attributes.height == 1200, "native size matches accepted scale");
+        Check(gui->set_scale(plugin, 1.25), "change scale while visible");
+        Check(gui->get_size(plugin, &width, &height) && width == 750 && height == 750,
+              "fractional host scale updates visible editor size");
+        Check(gui->set_scale(plugin, 2.), "restore scale before hide");
+      }
       Check(host.WaitForRender(plugin, display, window), "GUI renders with this host's extensions");
       Check(gui->hide(plugin), "hide GUI");
       host.CheckUnregistered();
@@ -380,6 +405,8 @@ int main(int argc, char** argv)
       }
     }
   }
+  if (mode == "scale")
+    unsetenv("GDK_SCALE");
   gui->destroy(plugin);
   host.CheckUnregistered();
   host.pending = false;
