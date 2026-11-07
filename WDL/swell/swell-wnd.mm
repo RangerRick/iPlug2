@@ -1850,17 +1850,17 @@ bool IsWindowVisible(HWND hwnd)
   if (!hwnd) return false;
 
   SWELL_BEGIN_TRY
-  id turd=(id)hwnd;
-  if ([turd isKindOfClass:[NSView class]])
+  id view=(id)hwnd;
+  if ([view isKindOfClass:[NSView class]])
   {
-    NSWindow *w = [turd window];
+    NSWindow *w = [view window];
     if (w && ![w isVisible]) return false;
     
-    return ![turd isHiddenOrHasHiddenAncestor];
+    return ![view isHiddenOrHasHiddenAncestor];
   }
-  if ([turd isKindOfClass:[NSWindow class]])
+  if ([view isKindOfClass:[NSWindow class]])
   {
-    return !![turd isVisible];
+    return !![view isVisible];
   }
   SWELL_END_TRY(;)
   return true;
@@ -4505,10 +4505,10 @@ int TabCtrl_InsertItem(HWND hwnd, int idx, TCITEM *item)
   NSString *str=(NSString *)SWELL_CStringToCFString(item->pszText);  
   [tabitem setLabel:str];
   [str release];
-  id turd=[tv getNotificationWindow];
+  id dest=[tv getNotificationWindow];
   [tv setNotificationWindow:nil];
   [tv insertTabViewItem:tabitem atIndex:idx];
-  [tv setNotificationWindow:turd];
+  [tv setNotificationWindow:dest];
   [tabitem release];
   return idx;
 }
@@ -5641,6 +5641,8 @@ HWND WindowFromPoint(POINT p)
       if (p.x >= fr.origin.x && p.x < fr.origin.x + fr.size.width &&
           p.y >= fr.origin.y && p.y < fr.origin.y + fr.size.height)
       {
+        NSView *cv = [wnd contentView];
+        if ([cv isKindOfClass:[SWELL_FocusRectWnd class]]) continue;
         bestwnd=wnd;
         break;
       }    
@@ -5746,7 +5748,7 @@ BOOL InvalidateRect(HWND hwnd, const RECT *r, int eraseBk)
       SWELL_hwndChild *hc = (SWELL_hwndChild*)view;
       if (hc->m_use_metal > 0)
       {
-        if (![hc isHiddenOrHasHiddenAncestor]) 
+        if (![hc isHiddenOrHasHiddenAncestor] && [[hc window] isVisible])
         {
           NSRect sz = [hc bounds];
           if (sz.size.width != 0.0 && sz.size.height != 0.0)
@@ -6989,13 +6991,20 @@ BOOL ShellExecute(HWND hwndDlg, const char *action,  const char *content1, const
 
 
 
+extern int *g_swell_focusrect_color;
 
 @implementation SWELL_FocusRectWnd
 
 -(BOOL)isOpaque { return YES; }
 -(void) drawRect:(NSRect)rect
 {
-  NSColor *col=[NSColor colorWithCalibratedRed:0.5 green:0.5 blue:0.5 alpha:1.0];
+
+  NSColor *col=
+    g_swell_focusrect_color ?
+      [NSColor colorWithCalibratedRed:GetRValue(*g_swell_focusrect_color)/255.0
+                                green:GetGValue(*g_swell_focusrect_color)/255.0
+                                 blue:GetBValue(*g_swell_focusrect_color)/255.0 alpha:1.0] :
+      [NSColor colorWithCalibratedRed:0.5 green:0.5 blue:0.5 alpha:1.0];
   [col set];
   
   CGRect r = CGRectMake(rect.origin.x,rect.origin.y,rect.size.width,rect.size.height);
@@ -7555,6 +7564,7 @@ void SWELL_DisableContextMenu(HWND hwnd, bool dis)
 }
 
 extern char g_swell_disable_retina;
+extern bool g_swell_force_retina;
 int SWELL_IsRetinaHWND(HWND hwnd)
 {
   if (!hwnd || SWELL_GetOSXVersion() < 0x1070) return 0;
@@ -7573,6 +7583,8 @@ int SWELL_IsRetinaHWND(HWND hwnd)
   else if ([(id)hwnd isKindOfClass:[NSWindow class]]) w = (NSWindow *)hwnd;
 
   if (retina_disabled) return 0;
+
+  if (g_swell_force_retina) return 1;
 
   if (w)
   {
