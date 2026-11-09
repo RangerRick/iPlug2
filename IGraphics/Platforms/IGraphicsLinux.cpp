@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <climits>
 #include <limits>
+#include <chrono>
 #include <string>
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
@@ -71,6 +72,12 @@ double PhysicalWindowDimension(int designDimension, float drawScale, float scree
   // Probe large candidates without overflowing int; actual window sizes fit in int.
   const float logical = std::trunc(designDimension * drawScale);
   return std::trunc(logical * screenScale);
+}
+
+unsigned long HoverMillis()
+{
+  return static_cast<unsigned long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 std::vector<std::string> ParseDroppedFiles(const unsigned char* data, size_t length)
@@ -984,6 +991,7 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
 #endif
 
   CreateInputContext();
+  UpdateTooltips();
   GetDelegate()->OnUIOpen();
 
   // Mark dirty so the first timer tick renders immediately, even if no
@@ -1004,6 +1012,7 @@ void IGraphicsLinux::CloseWindow()
   }
   StopTimer();
   ResetDrag();
+  HideTooltip();
   if (!mDisplay)
     return;
 
@@ -1023,6 +1032,11 @@ void IGraphicsLinux::CloseWindow()
   }
 
   DestroyInputContext();
+  if (mTooltipFont)
+  {
+    XFreeFontSet(mDisplay, mTooltipFont);
+    mTooltipFont = nullptr;
+  }
   if (mPlugWnd)
   {
     XDestroyWindow(mDisplay, mPlugWnd);
@@ -1045,6 +1059,83 @@ void IGraphicsLinux::ResetDrag()
 {
   mDragSource = 0;
   mDragSupported = false;
+}
+
+void IGraphicsLinux::HideTooltip()
+{
+  if (mDisplay && mTooltipWindow)
+  {
+    XDestroyWindow(mDisplay, mTooltipWindow);
+    mTooltipWindow = 0;
+  }
+}
+
+void IGraphicsLinux::UpdateTooltips()
+{
+  HideTooltip();
+  mTooltipControl = -1;
+  mTooltipHoverTime = HoverMillis();
+}
+
+void IGraphicsLinux::ShowTooltip(float x, float y)
+{
+  if (!mDisplay || !mPlugWnd || !TooltipsEnabled() || mTooltipControl < 0 || mTooltipWindow)
+    return;
+  IControl* control = GetControl(mTooltipControl);
+  if (!control || control->IsHidden() || !control->GetTooltip() || !*control->GetTooltip())
+    return;
+  if (!mTooltipFont)
+  {
+    char** missing = nullptr;
+    int count = 0;
+    char* defaultString = nullptr;
+    mTooltipFont = XCreateFontSet(mDisplay, "-*-sans-medium-r-normal--14-*-*-*-*-*-*-*",
+                                  &missing, &count, &defaultString);
+    if (missing) XFreeStringList(missing);
+  }
+  if (!mTooltipFont) return;
+  const char* label = control->GetTooltip();
+  const int len = static_cast<int>(strlen(label));
+  XRectangle ink {}, logical {};
+  Xutf8TextExtents(mTooltipFont, label, len, &ink, &logical);
+  const int width = std::max(20, static_cast<int>(logical.width) + 12);
+  const int height = std::max(20, static_cast<int>(logical.height) + 8);
+  int rootX = 0, rootY = 0;
+  Window child = 0;
+  XTranslateCoordinates(mDisplay, mPlugWnd, DefaultRootWindow(mDisplay),
+                        static_cast<int>(x * GetTotalScale()) + 12,
+                        static_cast<int>(y * GetTotalScale()) + 20,
+                        &rootX, &rootY, &child);
+  const int screen = DefaultScreen(mDisplay);
+  rootX = std::max(0, std::min(rootX, DisplayWidth(mDisplay, screen) - width));
+  rootY = std::max(0, std::min(rootY, DisplayHeight(mDisplay, screen) - height));
+  XSetWindowAttributes attrs {};
+  attrs.override_redirect = 1;
+  attrs.background_pixel = WhitePixel(mDisplay, screen);
+  attrs.event_mask = ExposureMask;
+  mTooltipWindow = XCreateWindow(mDisplay, DefaultRootWindow(mDisplay), rootX, rootY,
+                                 width, height, 1, CopyFromParent, InputOutput,
+                                 CopyFromParent, CWOverrideRedirect | CWBackPixel | CWEventMask, &attrs);
+  if (mTooltipWindow)
+    XMapRaised(mDisplay, mTooltipWindow);
+}
+
+void IGraphicsLinux::DrawTooltip()
+{
+  if (!mTooltipWindow || mTooltipControl < 0 || !mTooltipFont) return;
+  IControl* control = GetControl(mTooltipControl);
+  if (!control || !control->GetTooltip()) return;
+  const char* label = control->GetTooltip();
+  XRectangle ink {}, logical {};
+  Xutf8TextExtents(mTooltipFont, label, static_cast<int>(strlen(label)), &ink, &logical);
+  XWindowAttributes attrs {};
+  if (!XGetWindowAttributes(mDisplay, mTooltipWindow, &attrs)) return;
+  GC gc = XCreateGC(mDisplay, mTooltipWindow, 0, nullptr);
+  XSetForeground(mDisplay, gc, BlackPixel(mDisplay, DefaultScreen(mDisplay)));
+  XDrawRectangle(mDisplay, mTooltipWindow, gc, 0, 0, attrs.width - 1, attrs.height - 1);
+  Xutf8DrawString(mDisplay, mTooltipWindow, mTooltipFont, gc, 6, 4 - logical.y,
+                  label, static_cast<int>(strlen(label)));
+  XFreeGC(mDisplay, gc);
 }
 
 void IGraphicsLinux::PlatformResize(bool parentHasResized)
@@ -2182,6 +2273,11 @@ void IGraphicsLinux::DispatchX11Events()
   {
     XEvent ev;
     XNextEvent(mDisplay, &ev);
+    if (ev.type == Expose && ev.xexpose.window == mTooltipWindow)
+    {
+      DrawTooltip();
+      continue;
+    }
     if (XFilterEvent(&ev, mPlugWnd))
       continue;
 
@@ -2248,6 +2344,8 @@ void IGraphicsLinux::DispatchX11Events()
       case ButtonPress:
       case ButtonRelease:
       {
+        HideTooltip();
+        mTooltipControl = -1;
         XButtonEvent& be = ev.xbutton;
         const float x = be.x / scale;
         const float y = be.y / scale;
@@ -2340,6 +2438,8 @@ void IGraphicsLinux::DispatchX11Events()
 
         if (lbtn || rbtn)
         {
+          HideTooltip();
+          mTooltipControl = -1;
           OnMouseDrag(list);
           mCursorX = x;
           mCursorY = y;
@@ -2349,11 +2449,22 @@ void IGraphicsLinux::DispatchX11Events()
           OnMouseOver(x, y, mod);
           mCursorX = x;
           mCursorY = y;
+          const int hovered = TooltipsEnabled() ? GetMouseOver() : -1;
+          if (hovered != mTooltipControl || std::fabs(mTooltipX - x) > 4.f || std::fabs(mTooltipY - y) > 4.f)
+          {
+            HideTooltip();
+            mTooltipControl = hovered;
+            mTooltipX = x;
+            mTooltipY = y;
+            mTooltipHoverTime = HoverMillis();
+          }
         }
         break;
       }
 
       case LeaveNotify:
+        HideTooltip();
+        mTooltipControl = -1;
         OnMouseOut();
         break;
 
@@ -2365,6 +2476,7 @@ void IGraphicsLinux::DispatchX11Events()
         break;
 
       case FocusOut:
+        HideTooltip();
         if (mInputContext)
           XUnsetICFocus(mInputContext);
         break;
@@ -2381,6 +2493,8 @@ void IGraphicsLinux::DispatchX11Events()
           auto& msg = ev.xclient;
           if (msg.message_type == mXdndEnter)
           {
+            HideTooltip();
+            mTooltipControl = -1;
             ResetDrag();
             const int version = (msg.data.l[1] >> 24) & 0xff;
             if (version >= 3)
@@ -2587,6 +2701,12 @@ void IGraphicsLinux::OnDisplayTimer()
   DispatchX11Events();
   if (!mDisplay || !mPlugWnd || mCloseRequested)
     return;
+
+  if (!TooltipsEnabled() && mTooltipWindow)
+    HideTooltip();
+  if (mTooltipControl >= 0 && !mTooltipWindow && TooltipsEnabled() &&
+      HoverMillis() - mTooltipHoverTime >= 700)
+    ShowTooltip(mTooltipX, mTooltipY);
 
   IRECTList rects;
   if (mNeedsRedraw || IsDirty(rects))

@@ -125,7 +125,7 @@ public:
   void CloseWindow() override;
   bool WindowIsOpen() override { return mPlugWnd != 0; }
 
-  void UpdateTooltips() override {}
+  void UpdateTooltips() override;
 
   bool RevealPathInExplorerOrFinder(WDL_String& path, bool select) override;
   void PromptForFile(WDL_String& fileName, WDL_String& path, EFileAction action, const char* ext, IFileDialogCompletionHandlerFunc completionHandler) override;
@@ -159,6 +159,9 @@ private:
   void CreateInputContext();
   void DestroyInputContext();
   void ResetDrag();
+  void HideTooltip();
+  void ShowTooltip(float x, float y);
+  void DrawTooltip();
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fileNameOrResID) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fontName, ETextStyle style) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, void* pData, int dataSize) override;
@@ -187,13 +190,18 @@ private:
   Window mPlugWnd = 0;
   Window mParentWnd = 0;
   Atom mWMDeleteMessage = 0;
-  bool mInputMethodDisconnected = false;
   Atom mXdndAware = 0, mXdndEnter = 0, mXdndPosition = 0, mXdndStatus = 0;
   Atom mXdndLeave = 0, mXdndDrop = 0, mXdndFinished = 0, mXdndSelection = 0;
   Atom mXdndTypeList = 0, mXdndActionCopy = 0, mUriList = 0, mDropProperty = 0;
   Window mDragSource = 0;
   bool mDragSupported = false;
   float mDropX = 0.f, mDropY = 0.f;
+  Window mTooltipWindow = 0;
+  XFontSet mTooltipFont = nullptr;
+  int mTooltipControl = -1;
+  float mTooltipX = 0.f, mTooltipY = 0.f;
+  unsigned long mTooltipHoverTime = 0;
+  bool mInputMethodDisconnected = false;
   std::atomic<bool> mTimerRunning{false};
 
   float mHiddenCursorX = 0.f;
