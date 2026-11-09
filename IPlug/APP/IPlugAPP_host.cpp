@@ -112,12 +112,9 @@ bool IPlugAPPHost::OpenWindow(HWND pParent)
       // Export the GDK scale factor so IGraphicsLinux can create its X11 window
       // at the correct physical-pixel size for HiDPI (Xwayland 200% etc.).
       int scale = gdk_window_get_scale_factor(gdkWnd);
-      if (scale > 1)
-      {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", scale);
-        setenv("IPLUG2_SCREEN_SCALE", buf, 1 /* overwrite */);
-      }
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", scale);
+      setenv("IPLUG2_SCREEN_SCALE", buf, 1 /* overwrite */);
 
       // If the dialog has a menu bar, export its height so IGraphicsLinux
       // can offset the plugin window below it. The GDK window includes the

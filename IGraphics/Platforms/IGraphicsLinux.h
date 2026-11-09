@@ -186,6 +186,7 @@ private:
   Window mPlugWnd = 0;
   Window mParentWnd = 0;
   Atom mWMDeleteMessage = 0;
+  bool mInputMethodDisconnected = false;
   std::atomic<bool> mTimerRunning{false};
 
   float mHiddenCursorX = 0.f;

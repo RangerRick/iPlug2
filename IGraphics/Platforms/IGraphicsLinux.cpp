@@ -781,12 +781,18 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   // compare physW against XDisplayWidth — it will always exceed the logical extent
   // on HiDPI displays. Trust gdk_window_get_scale_factor instead.
   {
-    int gdkScale = 1;
+    float gdkScale = 1.f;
     const char* s = getenv("IPLUG2_SCREEN_SCALE");
     if (!s) s = getenv("GDK_SCALE");
-    if (s) gdkScale = std::clamp(atoi(s), 1, 8);
-    if (gdkScale > 1 && !GetDelegate()->HasHostScreenScale())
-      SetScreenScale(static_cast<float>(gdkScale));
+    if (s)
+    {
+      char* end = nullptr;
+      const float parsed = strtof(s, &end);
+      if (end != s && *end == '\0' && std::isfinite(parsed) && parsed >= 1.f && parsed <= 8.f)
+        gdkScale = parsed;
+    }
+    if (gdkScale > 1.f && !GetDelegate()->HasHostScreenScale())
+      SetScreenScale(gdkScale);
     // SetScreenScale is safe here: mPlugWnd==0 so PlatformResize skips,
     // and mVG==nullptr so DrawResize skips.
   }
@@ -1950,6 +1956,7 @@ static int KeysymToVK(KeySym ks)
 
 void IGraphicsLinux::CreateInputContext()
 {
+  mInputMethodDisconnected = false;
   // Use the host's locale/modifiers; changing them here would affect every plugin.
   mInputMethod = XOpenIM(mDisplay, nullptr, nullptr, nullptr);
   if (mInputMethod)
@@ -1960,12 +1967,14 @@ void IGraphicsLinux::CreateInputContext()
       auto* graphics = reinterpret_cast<IGraphicsLinux*>(data);
       graphics->mInputContext = nullptr;
       graphics->mInputMethod = nullptr;
+      graphics->mInputMethodDisconnected = true;
       fprintf(stderr, "The Linux input method disconnected; Compose and IME input are unavailable\n");
     };
     if (XSetIMValues(mInputMethod, XNDestroyCallback, &destroyed, nullptr))
     {
       fprintf(stderr, "Could not register the Linux input method disconnect callback; Compose and IME input are unavailable\n");
       DestroyInputContext();
+      mInputMethodDisconnected = true;
       return;
     }
     mInputContext = XCreateIC(mInputMethod,
@@ -1976,6 +1985,7 @@ void IGraphicsLinux::CreateInputContext()
   {
     fprintf(stderr, "Could not create the Linux input context; Compose and IME input are unavailable\n");
     DestroyInputContext();
+    mInputMethodDisconnected = true;
     return;
   }
   long filterEvents = 0;
@@ -2287,6 +2297,8 @@ void IGraphicsLinux::DispatchX11Events()
         break;
 
       case FocusIn:
+        if (mInputMethodDisconnected)
+          CreateInputContext();
         if (mInputContext)
           XSetICFocus(mInputContext);
         break;
