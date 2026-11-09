@@ -1093,6 +1093,14 @@ void IGraphicsLinux::ShowTooltip(float x, float y)
     mTooltipFont = XCreateFontSet(mDisplay, "-*-sans-medium-r-normal--14-*-*-*-*-*-*-*",
                                   &missing, &count, &defaultString);
     if (missing) XFreeStringList(missing);
+    // Minimal Xvfb installations (and some desktops) have no "sans" XLFD.
+    // The core fixed font is present with the standard X11 font packages.
+    if (!mTooltipFont)
+    {
+      missing = nullptr;
+      mTooltipFont = XCreateFontSet(mDisplay, "fixed", &missing, &count, &defaultString);
+      if (missing) XFreeStringList(missing);
+    }
   }
   if (!mTooltipFont) return;
   const char* label = control->GetTooltip();

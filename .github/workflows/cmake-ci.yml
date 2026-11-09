@@ -924,7 +924,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ninja-build \
-            xvfb xauth libgl1-mesa-dri \
+            xvfb xauth xfonts-base libgl1-mesa-dri \
             pkg-config \
             libgdk-pixbuf-2.0-dev \
             libglib2.0-dev \

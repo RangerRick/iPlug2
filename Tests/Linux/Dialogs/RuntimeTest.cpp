@@ -1,6 +1,7 @@
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/Xresource.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -554,6 +555,160 @@ public:
   unsigned mReleases = 0;
   float mX = 0.f, mY = 0.f;
 };
+
+class DropProbe final : public IControl
+{
+public:
+  DropProbe() : IControl(IRECT(50, 40, 110, 90)) { SetTooltip("Drop files here"); }
+  void Draw(IGraphics&) override {}
+  void OnDrop(const char* path) override { mPaths = {path}; }
+  void OnDropMultiple(const std::vector<const char*>& paths) override
+  {
+    mPaths.clear();
+    for (const char* path : paths) mPaths.emplace_back(path);
+  }
+  std::vector<std::string> mPaths;
+};
+
+static std::vector<Window> RootChildren(Display* display)
+{
+  Window root = 0, parent = 0, *children = nullptr;
+  unsigned count = 0;
+  std::vector<Window> result;
+  XSync(display, 0);
+  if (XQueryTree(display, DefaultRootWindow(display), &root, &parent, &children, &count) && count)
+    result.assign(children, children + count);
+  if (children) XFree(children);
+  return result;
+}
+
+static void SendClient(Display* display, Window target, Atom type, long a, long b = 0,
+                       long c = 0, long d = 0, long e = 0)
+{
+  XEvent event {};
+  event.xclient.type = ClientMessage;
+  event.xclient.display = display;
+  event.xclient.window = target;
+  event.xclient.message_type = type;
+  event.xclient.format = 32;
+  event.xclient.data.l[0] = a;
+  event.xclient.data.l[1] = b;
+  event.xclient.data.l[2] = c;
+  event.xclient.data.l[3] = d;
+  event.xclient.data.l[4] = e;
+  XSendEvent(display, target, 0, NoEventMask, &event);
+  XSync(display, 0);
+}
+
+static void TestDragAndTooltip(bool drag)
+{
+  TestDelegate delegate(true);
+  Check(delegate.OpenWindow(nullptr) != nullptr, "open editor for X11 interaction test");
+  if (!delegate.GetUI()) return;
+  auto& graphics = *static_cast<IGraphicsLinux*>(delegate.GetUI());
+  auto* probe = new DropProbe;
+  graphics.AttachControl(probe);
+  graphics.EnableMouseOver(true);
+  graphics.EnableTooltips(true);
+  Display* host = XOpenDisplay(nullptr);
+  Check(host != nullptr, "open independent X11 source connection");
+  if (!host) { delegate.CloseWindow(); return; }
+  const Window editor = static_cast<Window>(reinterpret_cast<uintptr_t>(graphics.GetWindow()));
+  const Window source = XCreateSimpleWindow(host, DefaultRootWindow(host), 0, 0, 1, 1, 0, 0, 0);
+  XSelectInput(host, source, StructureNotifyMask | PropertyChangeMask);
+  const auto atom = [host](const char* name) { return XInternAtom(host, name, 0); };
+  if (drag)
+  {
+    const Atom selection = atom("XdndSelection"), uri = atom("text/uri-list");
+    const Atom status = atom("XdndStatus"), finished = atom("XdndFinished");
+    XSetSelectionOwner(host, selection, source, 0);
+    XSync(host, 0);
+    Check(XGetSelectionOwner(host, selection) == source, "own Xdnd selection");
+    int rootX = 0, rootY = 0;
+    Window child = 0;
+    XTranslateCoordinates(host, editor, DefaultRootWindow(host), 70, 60, &rootX, &rootY, &child);
+    for (const char* payload : {"file:///tmp/one%20file.wav\r\n",
+                                "# comment\nfile://localhost/tmp/one%20file.wav\nfile:///tmp/two.wav\n"})
+    {
+      SendClient(host, editor, atom("XdndEnter"), source, 5L << 24, uri);
+      SendClient(host, editor, atom("XdndPosition"), source, 0,
+                 (rootX << 16) | (rootY & 0xffff), 0, atom("XdndActionCopy"));
+      graphics.ProcessX11Events();
+      XSync(host, 0);
+      XEvent reply {};
+      const bool gotStatus = XCheckTypedWindowEvent(host, source, ClientMessage, &reply);
+      Check(gotStatus && reply.xclient.message_type == status && reply.xclient.data.l[1] == 1,
+            "Xdnd target accepts URI list");
+      SendClient(host, editor, atom("XdndDrop"), source, 0, 0);
+      graphics.ProcessX11Events();
+      XSync(host, 0);
+      XEvent request {};
+      const bool requested = XCheckTypedWindowEvent(host, source, SelectionRequest, &request);
+      Check(requested && request.xselectionrequest.target == uri,
+            "Xdnd requests URI-list selection data");
+      if (!requested) break;
+      XChangeProperty(host, request.xselectionrequest.requestor, request.xselectionrequest.property,
+                      uri, 8, PropModeReplace, reinterpret_cast<const unsigned char*>(payload),
+                      static_cast<int>(strlen(payload)));
+      XEvent notify {};
+      notify.xselection.type = SelectionNotify;
+      notify.xselection.display = host;
+      notify.xselection.requestor = request.xselectionrequest.requestor;
+      notify.xselection.selection = selection;
+      notify.xselection.target = uri;
+      notify.xselection.property = request.xselectionrequest.property;
+      notify.xselection.time = request.xselectionrequest.time;
+      XSendEvent(host, notify.xselection.requestor, 0, NoEventMask, &notify);
+      XSync(host, 0);
+      graphics.ProcessX11Events();
+      XSync(host, 0);
+      Check(XCheckTypedWindowEvent(host, source, ClientMessage, &reply) &&
+            reply.xclient.message_type == finished && reply.xclient.data.l[1] == 1,
+            "Xdnd target reports a successful drop");
+      const std::vector<std::string> expected = strstr(payload, "two.wav") ?
+        std::vector<std::string>{"/tmp/one file.wav", "/tmp/two.wav"} :
+        std::vector<std::string>{"/tmp/one file.wav"};
+      Check(probe->mPaths == expected, "dropped paths reach the hovered control decoded and in order");
+    }
+  }
+  else
+  {
+    const auto before = RootChildren(host);
+    XEvent motion {};
+    motion.xmotion.type = MotionNotify;
+    motion.xmotion.display = host;
+    motion.xmotion.window = editor;
+    motion.xmotion.x = 70;
+    motion.xmotion.y = 60;
+    XSendEvent(host, editor, 0, NoEventMask, &motion);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+    std::this_thread::sleep_for(std::chrono::milliseconds(750));
+    graphics.OnDisplayTimer();
+    const auto after = RootChildren(host);
+    std::vector<Window> added;
+    for (Window window : after)
+      if (std::find(before.begin(), before.end(), window) == before.end()) added.push_back(window);
+    Check(added.size() == 1, "hover creates one tooltip X11 window");
+    if (!added.empty())
+    {
+      XWindowAttributes attrs {};
+      Check(XGetWindowAttributes(host, added[0], &attrs) && attrs.map_state == IsViewable &&
+            attrs.override_redirect, "tooltip window is mapped and override-redirect");
+    }
+    XEvent leave {};
+    leave.xcrossing.type = LeaveNotify;
+    leave.xcrossing.display = host;
+    leave.xcrossing.window = editor;
+    XSendEvent(host, editor, 0, NoEventMask, &leave);
+    XSync(host, 0);
+    graphics.ProcessX11Events();
+    Check(RootChildren(host) == before, "leaving editor destroys tooltip window");
+  }
+  delegate.CloseWindow();
+  XDestroyWindow(host, source);
+  XCloseDisplay(host);
+}
 
 static void CheckText(const std::string& actual, const char* expected, const char* message)
 {
@@ -1246,6 +1401,8 @@ int main(int argc, char** argv)
     TestScaledKeys();
   else if (strcmp(argv[1], "focus") == 0)
     TestFocus();
+  else if (strcmp(argv[1], "dnd") == 0 || strcmp(argv[1], "tooltip") == 0)
+    TestDragAndTooltip(strcmp(argv[1], "dnd") == 0);
   else if (strcmp(argv[1], "resize") == 0)
     TestResize();
   else if (strcmp(argv[1], "resize-roundtrip") == 0)

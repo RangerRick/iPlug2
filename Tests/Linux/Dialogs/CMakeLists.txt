@@ -36,7 +36,7 @@ add_dependencies(LinuxRuntimeTest LinuxTimerTest)
 add_test(NAME linux-timer-lifecycle COMMAND LinuxTimerTest)
 set_tests_properties(linux-timer-lifecycle PROPERTIES TIMEOUT 15)
 
-foreach(mode focus close glx-context resize resize-roundtrip double-click scaled-keys keyboard keyboard-no-im keyboard-no-im-c parent-validation
+foreach(mode focus close glx-context resize resize-roundtrip double-click scaled-keys keyboard keyboard-no-im keyboard-no-im-c parent-validation dnd tooltip
   native-close host-native-close clipboard clipboard-instances clipboard-fail
   clipboard-disappearing clipboard-host-handler core-timer core-timer-early core-timer-fail)
   add_test(NAME linux-${mode}
