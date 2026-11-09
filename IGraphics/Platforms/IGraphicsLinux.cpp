@@ -52,6 +52,7 @@
 // headers from being re-included.
 #include "IGraphicsLinux.h"
 #include "IGraphicsStructs.h"
+#include "IControl.h"
 #include "wdlutf8.h"
 
 #if defined APP_API || defined REAPER_EXT_API
@@ -2126,7 +2127,6 @@ void IGraphicsLinux::CreateInputContext()
     {
       fprintf(stderr, "Could not register the Linux input method disconnect callback; Compose and IME input are unavailable\n");
       DestroyInputContext();
-      mInputMethodDisconnected = true;
       return;
     }
     mInputContext = XCreateIC(mInputMethod,
@@ -2137,7 +2137,6 @@ void IGraphicsLinux::CreateInputContext()
   {
     fprintf(stderr, "Could not create the Linux input context; Compose and IME input are unavailable\n");
     DestroyInputContext();
-    mInputMethodDisconnected = true;
     return;
   }
   long filterEvents = 0;
