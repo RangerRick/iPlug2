@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <climits>
 #include <limits>
+#include <string>
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
 
@@ -70,6 +71,44 @@ double PhysicalWindowDimension(int designDimension, float drawScale, float scree
   // Probe large candidates without overflowing int; actual window sizes fit in int.
   const float logical = std::trunc(designDimension * drawScale);
   return std::trunc(logical * screenScale);
+}
+
+std::vector<std::string> ParseDroppedFiles(const unsigned char* data, size_t length)
+{
+  std::vector<std::string> paths;
+  const std::string list(reinterpret_cast<const char*>(data), length);
+  for (size_t start = 0; start < list.size();)
+  {
+    const size_t end = list.find('\n', start);
+    const std::string line = list.substr(start, end == std::string::npos ? end : end - start);
+    start = end == std::string::npos ? list.size() : end + 1;
+    if (line.empty() || line[0] == '#') continue;
+    const std::string uri = line.back() == '\r' ? line.substr(0, line.size() - 1) : line;
+    if (uri.compare(0, 7, "file://") != 0) continue;
+    size_t pathStart = 7;
+    if (uri.compare(pathStart, 10, "localhost/") == 0) pathStart += 9;
+    if (pathStart >= uri.size() || uri[pathStart] != '/') continue;
+    std::string path;
+    bool valid = true;
+    for (size_t i = pathStart; i < uri.size(); ++i)
+    {
+      if (uri[i] != '%') { path += uri[i]; continue; }
+      if (i + 2 >= uri.size()) { valid = false; break; }
+      auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      const int hi = hex(uri[i + 1]), lo = hex(uri[i + 2]);
+      if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) { valid = false; break; }
+      path += static_cast<char>((hi << 4) | lo);
+      i += 2;
+    }
+    if (valid && path.find('\0') == std::string::npos)
+      paths.push_back(std::move(path));
+  }
+  return paths;
 }
 
 class LinuxClipboard
@@ -877,6 +916,21 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
   mClipboardAtom    = XInternAtom(mDisplay, "CLIPBOARD",         0 /* False */);
   mUTF8StringAtom   = XInternAtom(mDisplay, "UTF8_STRING",       0 /* False */);
   mSelDataAtom      = XInternAtom(mDisplay, "IPLUG2_SEL_DATA",   0 /* False */);
+  mXdndAware = XInternAtom(mDisplay, "XdndAware", 0);
+  mXdndEnter = XInternAtom(mDisplay, "XdndEnter", 0);
+  mXdndPosition = XInternAtom(mDisplay, "XdndPosition", 0);
+  mXdndStatus = XInternAtom(mDisplay, "XdndStatus", 0);
+  mXdndLeave = XInternAtom(mDisplay, "XdndLeave", 0);
+  mXdndDrop = XInternAtom(mDisplay, "XdndDrop", 0);
+  mXdndFinished = XInternAtom(mDisplay, "XdndFinished", 0);
+  mXdndSelection = XInternAtom(mDisplay, "XdndSelection", 0);
+  mXdndTypeList = XInternAtom(mDisplay, "XdndTypeList", 0);
+  mXdndActionCopy = XInternAtom(mDisplay, "XdndActionCopy", 0);
+  mUriList = XInternAtom(mDisplay, "text/uri-list", 0);
+  mDropProperty = XInternAtom(mDisplay, "IPLUG2_DROP_DATA", 0);
+  const unsigned long xdndVersion = 5;
+  XChangeProperty(mDisplay, mPlugWnd, mXdndAware, XA_ATOM, 32, PropModeReplace,
+                  reinterpret_cast<const unsigned char*>(&xdndVersion), 1);
 
   // WM protocols and size hints are only appropriate for top-level windows.
   // When embedded in a host parent, setting them causes the window manager to
@@ -949,6 +1003,7 @@ void IGraphicsLinux::CloseWindow()
     return;
   }
   StopTimer();
+  ResetDrag();
   if (!mDisplay)
     return;
 
@@ -984,6 +1039,12 @@ void IGraphicsLinux::CloseWindow()
 
   XCloseDisplay(mDisplay);
   mDisplay = nullptr;
+}
+
+void IGraphicsLinux::ResetDrag()
+{
+  mDragSource = 0;
+  mDragSupported = false;
 }
 
 void IGraphicsLinux::PlatformResize(bool parentHasResized)
@@ -2315,6 +2376,84 @@ void IGraphicsLinux::DispatchX11Events()
 
       case ClientMessage:
       {
+        if (ev.xclient.window == mPlugWnd && ev.xclient.format == 32)
+        {
+          auto& msg = ev.xclient;
+          if (msg.message_type == mXdndEnter)
+          {
+            ResetDrag();
+            const int version = (msg.data.l[1] >> 24) & 0xff;
+            if (version >= 3)
+            {
+              mDragSource = static_cast<Window>(msg.data.l[0]);
+              if (msg.data.l[1] & 1)
+              {
+                Atom type = 0; int format = 0; unsigned long count = 0, remaining = 0;
+                unsigned char* data = nullptr;
+                if (XGetWindowProperty(mDisplay, mDragSource, mXdndTypeList, 0, 1024,
+                      0, XA_ATOM, &type, &format, &count, &remaining, &data) == 0 &&
+                    type == XA_ATOM && format == 32 && remaining == 0 && data)
+                {
+                  const auto* types = reinterpret_cast<const Atom*>(data);
+                  for (unsigned long i = 0; i < count; ++i)
+                    if (types[i] == mUriList) mDragSupported = true;
+                }
+                if (data) XFree(data);
+              }
+              else
+                for (int i = 2; i < 5; ++i)
+                  if (static_cast<Atom>(msg.data.l[i]) == mUriList) mDragSupported = true;
+            }
+            break;
+          }
+          if (msg.message_type == mXdndLeave && static_cast<Window>(msg.data.l[0]) == mDragSource)
+          {
+            ResetDrag();
+            break;
+          }
+          if (msg.message_type == mXdndPosition && static_cast<Window>(msg.data.l[0]) == mDragSource)
+          {
+            int x = 0, y = 0; Window child = 0;
+            const int rootX = static_cast<short>(msg.data.l[2] >> 16);
+            const int rootY = static_cast<short>(msg.data.l[2] & 0xffff);
+            XTranslateCoordinates(mDisplay, DefaultRootWindow(mDisplay), mPlugWnd,
+                                  rootX, rootY, &x, &y, &child);
+            mDropX = x / GetTotalScale();
+            mDropY = y / GetTotalScale();
+            XEvent reply {};
+            reply.xclient.type = ClientMessage;
+            reply.xclient.display = mDisplay;
+            reply.xclient.window = mDragSource;
+            reply.xclient.message_type = mXdndStatus;
+            reply.xclient.format = 32;
+            reply.xclient.data.l[0] = mPlugWnd;
+            reply.xclient.data.l[1] = mDragSupported ? 1 : 0;
+            reply.xclient.data.l[4] = mDragSupported ? mXdndActionCopy : 0;
+            XSendEvent(mDisplay, mDragSource, 0, NoEventMask, &reply);
+            XFlush(mDisplay);
+            break;
+          }
+          if (msg.message_type == mXdndDrop && static_cast<Window>(msg.data.l[0]) == mDragSource)
+          {
+            if (mDragSupported)
+              XConvertSelection(mDisplay, mXdndSelection, mUriList, mDropProperty,
+                                mPlugWnd, msg.data.l[2]);
+            else
+            {
+              XEvent reply {};
+              reply.xclient.type = ClientMessage;
+              reply.xclient.display = mDisplay;
+              reply.xclient.window = mDragSource;
+              reply.xclient.message_type = mXdndFinished;
+              reply.xclient.format = 32;
+              reply.xclient.data.l[0] = mPlugWnd;
+              XSendEvent(mDisplay, mDragSource, 0, NoEventMask, &reply);
+              ResetDrag();
+            }
+            XFlush(mDisplay);
+            break;
+          }
+        }
         if (ev.xclient.message_type == XInternAtom(mDisplay, "WM_PROTOCOLS", 0) &&
             ev.xclient.format == 32 && (Atom)ev.xclient.data.l[0] == mWMDeleteMessage)
         {
@@ -2322,6 +2461,55 @@ void IGraphicsLinux::DispatchX11Events()
           mTimerRunning = false;
           return;
         }
+        break;
+      }
+
+      case SelectionNotify:
+      {
+        if (ev.xselection.selection != mXdndSelection || !mDragSource) break;
+        bool accepted = false;
+        const Window dragSource = mDragSource;
+        const Window targetWindow = mPlugWnd;
+        if (ev.xselection.property == mDropProperty)
+        {
+          Atom type = 0; int format = 0; unsigned long count = 0, remaining = 0;
+          unsigned char* data = nullptr;
+          if (XGetWindowProperty(mDisplay, mPlugWnd, mDropProperty, 0, 262144, 1,
+                mUriList, &type, &format, &count, &remaining, &data) == 0 &&
+              type == mUriList && format == 8 && remaining == 0 && data)
+          {
+            const auto paths = ParseDroppedFiles(data, count);
+            XFree(data);
+            data = nullptr;
+            if (!paths.empty())
+            {
+              accepted = true;
+              if (paths.size() == 1) OnDrop(paths[0].c_str(), mDropX, mDropY);
+              else
+              {
+                std::vector<const char*> pointers;
+                for (const auto& path : paths) pointers.push_back(path.c_str());
+                OnDropMultiple(pointers, mDropX, mDropY);
+              }
+            }
+          }
+          if (data) XFree(data);
+        }
+        XEvent reply {};
+        reply.xclient.type = ClientMessage;
+        reply.xclient.display = mDisplay;
+        reply.xclient.window = dragSource;
+        reply.xclient.message_type = mXdndFinished;
+        reply.xclient.format = 32;
+        reply.xclient.data.l[0] = targetWindow;
+        reply.xclient.data.l[1] = accepted ? 1 : 0;
+        reply.xclient.data.l[2] = accepted ? mXdndActionCopy : 0;
+        if (mDisplay && mPlugWnd == targetWindow)
+        {
+          XSendEvent(mDisplay, dragSource, 0, NoEventMask, &reply);
+          XFlush(mDisplay);
+        }
+        ResetDrag();
         break;
       }
 

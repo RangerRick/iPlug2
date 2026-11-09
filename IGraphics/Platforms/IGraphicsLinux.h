@@ -158,6 +158,7 @@ private:
   void DispatchKeyEvent(XKeyEvent& event);
   void CreateInputContext();
   void DestroyInputContext();
+  void ResetDrag();
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fileNameOrResID) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fontName, ETextStyle style) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, void* pData, int dataSize) override;
@@ -187,6 +188,12 @@ private:
   Window mParentWnd = 0;
   Atom mWMDeleteMessage = 0;
   bool mInputMethodDisconnected = false;
+  Atom mXdndAware = 0, mXdndEnter = 0, mXdndPosition = 0, mXdndStatus = 0;
+  Atom mXdndLeave = 0, mXdndDrop = 0, mXdndFinished = 0, mXdndSelection = 0;
+  Atom mXdndTypeList = 0, mXdndActionCopy = 0, mUriList = 0, mDropProperty = 0;
+  Window mDragSource = 0;
+  bool mDragSupported = false;
+  float mDropX = 0.f, mDropY = 0.f;
   std::atomic<bool> mTimerRunning{false};
 
   float mHiddenCursorX = 0.f;
