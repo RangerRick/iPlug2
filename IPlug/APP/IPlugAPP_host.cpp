@@ -18,9 +18,14 @@
 #ifdef OS_LINUX
 #include <alsa/asoundlib.h>
 #include <gdk/gdkx.h>  // GDK_WINDOW_XID
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #endif
 
 #include "IPlugLogger.h"
+#include "IPlugPaths.h" // IsSafeAbsoluteDir
 
 using namespace iplug;
 
@@ -65,7 +70,20 @@ bool IPlugAPPHost::Init()
   if (!InitState())
     return false;
   
+#ifdef OS_LINUX
+  if (!mIPlug->MainThreadTimerIsRunning())
+  {
+    fprintf(stderr, "Standalone main-thread dispatch is unavailable\n");
+    return false;
+  }
+  if (!TryToChangeAudioDriverType())
+  {
+    fprintf(stderr, "Could not initialize audio driver %u\n", mState.mAudioDriverType);
+    return false;
+  }
+#else
   TryToChangeAudioDriverType(); // will init RTAudio with an API type based on gState->mAudioDriverType
+#endif
   ProbeAudioIO(); // find out what audio IO devs are available and put their IDs in the global variables gAudioInputDevs / gAudioOutputDevs
   InitMidi(); // creates RTMidiIn and RTMidiOut objects
   ProbeMidiIO(); // find out what midi IO devs are available and put their names in the global variables gMidiInputDevs / gMidiOutputDevs
@@ -94,12 +112,9 @@ bool IPlugAPPHost::OpenWindow(HWND pParent)
       // Export the GDK scale factor so IGraphicsLinux can create its X11 window
       // at the correct physical-pixel size for HiDPI (Xwayland 200% etc.).
       int scale = gdk_window_get_scale_factor(gdkWnd);
-      if (scale > 1)
-      {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", scale);
-        setenv("IPLUG2_SCREEN_SCALE", buf, 1 /* overwrite */);
-      }
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", scale);
+      setenv("IPLUG2_SCREEN_SCALE", buf, 1 /* overwrite */);
 
       // If the dialog has a menu bar, export its height so IGraphicsLinux
       // can offset the plugin window below it. The GDK window includes the
@@ -142,12 +157,44 @@ bool IPlugAPPHost::InitState()
 #elif defined OS_LINUX
   const char* xdgConfig = getenv("XDG_CONFIG_HOME");
   const char* home = getenv("HOME");
-  if (xdgConfig && xdgConfig[0])
-    mINIPath.SetFormatted(MAX_PATH_LEN, "%s/%s/", xdgConfig, BUNDLE_NAME);
-  else if (home && home[0])
-    mINIPath.SetFormatted(MAX_PATH_LEN, "%s/.config/%s/", home, BUNDLE_NAME);
+  std::filesystem::path directory;
+  if (IsSafeAbsoluteDir(xdgConfig))
+    directory = std::filesystem::path(xdgConfig) / BUNDLE_NAME;
+  else if (IsSafeAbsoluteDir(home))
+    directory = std::filesystem::path(home) / ".config" / BUNDLE_NAME;
   else
+  {
+    fprintf(stderr, "Cannot resolve settings directory: a safe absolute XDG_CONFIG_HOME or HOME is required\n");
     return false;
+  }
+
+  // mkdir preserves private permissions on every newly created ancestor.
+  std::filesystem::path current;
+  for (const auto& part : directory)
+  {
+    current /= part;
+    if (mkdir(current.c_str(), S_IRWXU) != 0)
+    {
+      int error = errno;
+      struct stat info;
+      if (error == EEXIST)
+      {
+        if (stat(current.c_str(), &info) == 0)
+        {
+          if (S_ISDIR(info.st_mode))
+            continue;
+          error = ENOTDIR;
+        }
+        else
+          error = errno;
+      }
+      fprintf(stderr, "Cannot create settings directory '%s' at '%s': %s\n",
+              directory.c_str(), current.c_str(), strerror(error));
+      return false;
+    }
+  }
+  mINIPath.Set(directory.c_str());
+  mINIPath.Append("/");
 #endif
 
   struct stat st;
@@ -186,7 +233,7 @@ bool IPlugAPPHost::InitState()
     }
 
     // if settings file doesn't exist, populate with default values, otherwise overwrite
-    UpdateINI();
+    return UpdateINI();
   }
   else // folder doesn't exist - make folder and make file
   {
@@ -194,14 +241,14 @@ bool IPlugAPPHost::InitState()
     // folder doesn't exist - make folder and make file
     CreateDirectory(mINIPath.Get(), NULL);
     mINIPath.Append("settings.ini");
-    UpdateINI(); // will write file if doesn't exist
+    return UpdateINI(); // will write file if doesn't exist
 #elif defined(OS_MAC) || defined(OS_LINUX)
     int result_code = mkdir(mINIPath.Get(), S_IRWXU);
 
     if (!result_code)
     {
       mINIPath.Append("settings.ini");
-      UpdateINI(); // will write file if doesn't exist
+      return UpdateINI(); // will write file if doesn't exist
     }
     else
     {
@@ -213,42 +260,59 @@ bool IPlugAPPHost::InitState()
   return true;
 }
 
-void IPlugAPPHost::UpdateINI()
+bool IPlugAPPHost::UpdateINI()
 {
   char buf[STRBUFSZ]; // temp buffer for writing integers to profile strings
   const char* ini = mINIPath.Get();
+  bool success = true;
+  auto write = [&](const char* section, const char* key, const char* value) {
+    if (!success)
+      return;
+    if (!WritePrivateProfileString(section, key, value, ini))
+    {
+#ifdef OS_LINUX
+      const int error = errno;
+      fprintf(stderr, "Cannot save settings '%s' [%s] %s: %s\n",
+              ini, section, key, strerror(error ? error : EIO));
+#else
+      fprintf(stderr, "Cannot save settings '%s' [%s] %s\n", ini, section, key);
+#endif
+      success = false;
+    }
+  };
 
   sprintf(buf, "%u", mState.mAudioDriverType);
-  WritePrivateProfileString("audio", "driver", buf, ini);
+  write("audio", "driver", buf);
 
-  WritePrivateProfileString("audio", "indev", mState.mAudioInDev.Get(), ini);
-  WritePrivateProfileString("audio", "outdev", mState.mAudioOutDev.Get(), ini);
+  write("audio", "indev", mState.mAudioInDev.Get());
+  write("audio", "outdev", mState.mAudioOutDev.Get());
 
   sprintf(buf, "%u", mState.mAudioInChanL);
-  WritePrivateProfileString("audio", "in1", buf, ini);
+  write("audio", "in1", buf);
   sprintf(buf, "%u", mState.mAudioInChanR);
-  WritePrivateProfileString("audio", "in2", buf, ini);
+  write("audio", "in2", buf);
   sprintf(buf, "%u", mState.mAudioOutChanL);
-  WritePrivateProfileString("audio", "out1", buf, ini);
+  write("audio", "out1", buf);
   sprintf(buf, "%u", mState.mAudioOutChanR);
-  WritePrivateProfileString("audio", "out2", buf, ini);
+  write("audio", "out2", buf);
   //sprintf(buf, "%u", mState.mAudioInIsMono);
   //WritePrivateProfileString("audio", "monoinput", buf, ini);
 
   WDL_String str;
   str.SetFormatted(32, "%i", mState.mBufferSize);
-  WritePrivateProfileString("audio", "buffer", str.Get(), ini);
+  write("audio", "buffer", str.Get());
 
   str.SetFormatted(32, "%i", mState.mAudioSR);
-  WritePrivateProfileString("audio", "sr", str.Get(), ini);
+  write("audio", "sr", str.Get());
 
-  WritePrivateProfileString("midi", "indev", mState.mMidiInDev.Get(), ini);
-  WritePrivateProfileString("midi", "outdev", mState.mMidiOutDev.Get(), ini);
+  write("midi", "indev", mState.mMidiInDev.Get());
+  write("midi", "outdev", mState.mMidiOutDev.Get());
 
   sprintf(buf, "%u", mState.mMidiInChan);
-  WritePrivateProfileString("midi", "inchan", buf, ini);
+  write("midi", "inchan", buf);
   sprintf(buf, "%u", mState.mMidiOutChan);
-  WritePrivateProfileString("midi", "outchan", buf, ini);
+  write("midi", "outchan", buf);
+  return success;
 }
 
 std::string IPlugAPPHost::GetAudioDeviceName(uint32_t deviceID) const
@@ -269,6 +333,13 @@ std::string IPlugAPPHost::GetAudioDeviceName(uint32_t deviceID) const
 
 std::optional<uint32_t> IPlugAPPHost::GetAudioDeviceID(const char* deviceNameToTest) const
 {
+#ifdef OS_LINUX
+  if (!mDAC)
+  {
+    fprintf(stderr, "Cannot look up audio device '%s': audio driver is not initialized\n", deviceNameToTest);
+    return std::nullopt;
+  }
+#endif
   auto deviceIDs = mDAC->getDeviceIds();
 
   for (auto deviceID : deviceIDs)
@@ -469,6 +540,14 @@ bool IPlugAPPHost::TryToChangeAudio()
   // Skip audio initialization in no-I/O mode or screenshot mode
   if (mNoIO || IsScreenshotMode())
     return true;
+
+#ifdef OS_LINUX
+  if (!mDAC)
+  {
+    fprintf(stderr, "Cannot initialize audio: audio driver is not initialized\n");
+    return false;
+  }
+#endif
 
 #if defined OS_WIN
   // ASIO has one device, use the output for the input ID
@@ -860,4 +939,3 @@ void IPlugAPPHost::ErrorCallback(RtAudioErrorType type, const std::string &error
 {
   std::cerr << "\nerrorCallback: " << errorText << "\n\n";
 }
-

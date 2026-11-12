@@ -169,17 +169,17 @@ function(_iplug_copy_plugin target source_path dest_dir plugin_name is_bundle)
       COMMAND ${CMAKE_COMMAND} -E copy "${source_path}" "${dest_path}"
       COMMENT "[iPlug2] Deploying ${plugin_name} (copy)"
     )
-    # Also deploy the resources/ directory alongside flat plugins (CLAP/APP on Linux)
-    # Only copy if the resources directory exists (not all plugins have resources)
-    get_filename_component(_source_dir "${source_path}" DIRECTORY)
-    set(_res_src "${_source_dir}/resources")
-    set(_res_dst "${dest_dir}/resources")
-    add_custom_command(TARGET ${target} POST_BUILD
-      COMMAND ${CMAKE_COMMAND}
-        -Dsrc=${_res_src} -Ddst=${_res_dst}
-        -P ${_IPLUG_DEPLOY_SCRIPT_DIR}/CopyIfExists.cmake
-      COMMENT "[iPlug2] Deploying resources -> ${_res_dst}"
-    )
+    if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+      set(_res_src "${source_path}.resources")
+      set(_res_dst "${dest_path}.resources")
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+          "-Dsrc=${_res_src}" "-Ddst=${_res_dst}"
+          -P "${_IPLUG_DEPLOY_SCRIPT_DIR}/CopyIfExists.cmake"
+        COMMENT "[iPlug2] Deploying resources -> ${_res_dst}"
+        VERBATIM
+      )
+    endif()
   endif()
 endfunction()
 
@@ -240,6 +240,8 @@ function(iplug_deploy_target target format project_name)
   elseif(format STREQUAL "REAPEREXT")
     if(APPLE)
       set(plugin_name "${project_name}.dylib")
+    elseif(UNIX AND NOT EMSCRIPTEN)
+      set(plugin_name "${project_name}.so")
     else()
       set(plugin_name "${project_name}.dll")
     endif()
@@ -271,6 +273,24 @@ function(iplug_deploy_target target format project_name)
   else()
     # Default to SYMLINK
     _iplug_create_plugin_link(${target} "${source_path}" "${deploy_path}" "${plugin_name}")
+  endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND format STREQUAL "CLAP")
+    get_target_property(_has_web_resources ${target} IPLUG_LINUX_WEB_RESOURCES)
+    if(_has_web_resources)
+      set(_web_source "$<TARGET_FILE:${target}>.resources")
+      set(_web_dest "${deploy_path}/${plugin_name}.resources")
+      if(IPLUG_DEPLOY_METHOD STREQUAL "COPY")
+        add_custom_command(TARGET ${target} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E rm -rf "${_web_dest}"
+          COMMAND ${CMAKE_COMMAND} -E copy_directory "${_web_source}" "${_web_dest}"
+          VERBATIM)
+      else()
+        add_custom_command(TARGET ${target} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E rm -rf "${_web_dest}"
+          COMMAND ${CMAKE_COMMAND} -E create_symlink "${_web_source}" "${_web_dest}"
+          VERBATIM)
+      endif()
+    endif()
   endif()
 endfunction()
 

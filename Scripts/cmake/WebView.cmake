@@ -89,7 +89,9 @@ if(NOT TARGET iPlug2::WebView)
       ${WEBVIEW_DIR}/IPlugWebViewEditorDelegate.cpp
       ${WEBVIEW_DIR}/IPlugWebView_web.cpp
     )
-  elseif(UNIX AND NOT APPLE)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(WEBKITGTK REQUIRED IMPORTED_TARGET webkit2gtk-4.1)
     set(WEBVIEW_SRC
       ${WEBVIEW_DIR}/IPlugWebViewEditorDelegate.cpp
       ${WEBVIEW_DIR}/IPlugWebView_linux.cpp
@@ -131,7 +133,7 @@ if(NOT TARGET iPlug2::WebView)
     target_link_libraries(iPlug2::WebView INTERFACE
       iPlug2::IPlug
     )
-  elseif(UNIX AND NOT APPLE)
-    target_link_libraries(iPlug2::WebView INTERFACE iPlug2::IPlug)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(iPlug2::WebView INTERFACE iPlug2::IPlug PkgConfig::WEBKITGTK ${CMAKE_DL_LIBS})
   endif()
 endif()

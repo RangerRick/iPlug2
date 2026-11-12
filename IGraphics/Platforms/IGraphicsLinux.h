@@ -60,6 +60,8 @@
 // GL/glx.h must be included BEFORE this header (in the .cpp file) while Bool
 // is still defined from Xlib.h; the GLX_H include guard prevents re-inclusion.
 #include <atomic>
+#include <vector>
+#include "IPlugTimer.h"
 #include "IGraphics_select.h"
 
 BEGIN_IPLUG_NAMESPACE
@@ -83,9 +85,9 @@ public:
    *  Used by CLAP posix-fd support to register with the host's event loop. */
   int GetX11Fd() const { return mDisplay ? XConnectionNumber(mDisplay) : -1; }
 
-  /** When host-driven = true the internal timer thread is suppressed.
+  /** When host-driven = true the internal timer is suppressed.
    *  The host drives rendering via onTimer / onPosixFd callbacks instead.
-   *  Safe to call after OpenWindow — stops the timer thread if running. */
+   *  Safe to call after OpenWindow — stops the internal timer if running. */
   void SetHostDriven(bool hostDriven)
   {
     mHostDriven = hostDriven;
@@ -97,11 +99,19 @@ public:
   void OnDisplayTimer();
   /** Called by CLAP host posix-fd callback to drain pending X11 events. */
   void ProcessX11Events();
+  /** A native close is completed by the owner after X11 dispatch returns. */
+  bool WindowCloseRequested() const { return mCloseRequested; }
+  void RequestWindowClose() { mCloseRequested = true; }
+  bool IsInPlatformCallback() const { return mDispatchDepth != 0; }
 
   void PlatformResize(bool parentHasResized) override;
   void DrawResize() override;
-  void OnBeginHostResize(int physW, int physH) override;
-  void OnEndHostResize() override;
+  /** Apply a new host scale without interpreting older native sizes at the new scale. */
+  void SetScreenScaleFromHost(float scale);
+  /** Apply a host/X11 size in physical pixels, preserving the configured resize mode. */
+  void ResizeFromHost(int width, int height);
+  /** Constrain a proposed host size in physical pixels without resizing the editor. */
+  void ConstrainHostResize(int& width, int& height);
 
   void HideMouseCursor(bool hide, bool lock) override;
   void MoveMouseCursor(float x, float y) override;
@@ -115,7 +125,7 @@ public:
   void CloseWindow() override;
   bool WindowIsOpen() override { return mPlugWnd != 0; }
 
-  void UpdateTooltips() override {}
+  void UpdateTooltips() override;
 
   bool RevealPathInExplorerOrFinder(WDL_String& path, bool select) override;
   void PromptForFile(WDL_String& fileName, WDL_String& path, EFileAction action, const char* ext, IFileDialogCompletionHandlerFunc completionHandler) override;
@@ -136,6 +146,22 @@ protected:
   void CreatePlatformTextEntry(int paramIdx, const IText& text, const IRECT& bounds, int length, const char* str) override;
 
 private:
+  void CalculateHostResize(int width, int height, int& designWidth, int& designHeight, float& scale);
+  struct DispatchScope
+  {
+    explicit DispatchScope(int& depth) : mDepth(depth) { ++mDepth; }
+    ~DispatchScope() { --mDepth; }
+    int& mDepth;
+  };
+
+  void DispatchX11Events();
+  void DispatchKeyEvent(XKeyEvent& event);
+  void CreateInputContext();
+  void DestroyInputContext();
+  void ResetDrag();
+  void HideTooltip();
+  void ShowTooltip(float x, float y);
+  void DrawTooltip();
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fileNameOrResID) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, const char* fontName, ETextStyle style) override;
   PlatformFontPtr LoadPlatformFont(const char* fontID, void* pData, int dataSize) override;
@@ -144,52 +170,64 @@ private:
   void ActivateGLContext() override;
   void DeactivateGLContext() override;
 
+  struct GLContextState
+  {
+    Display* display;
+    void* context;
+    unsigned long drawable;
+    unsigned long readDrawable;
+  };
+  std::vector<GLContextState> mGLContextStack;
+
   XVisualInfo* CreateGLContext();  // returns the visual used; caller must XFree() it
   void DestroyGLContext();
   void* mGLContext  = nullptr;  // GLXContext
   Colormap mGLColormap = 0;
 
   Display* mDisplay = nullptr;
+  XIM mInputMethod = nullptr;
+  XIC mInputContext = nullptr;
   Window mPlugWnd = 0;
   Window mParentWnd = 0;
   Atom mWMDeleteMessage = 0;
+  Atom mXdndAware = 0, mXdndEnter = 0, mXdndPosition = 0, mXdndStatus = 0;
+  Atom mXdndLeave = 0, mXdndDrop = 0, mXdndFinished = 0, mXdndSelection = 0;
+  Atom mXdndTypeList = 0, mXdndActionCopy = 0, mUriList = 0, mDropProperty = 0;
+  Window mDragSource = 0;
+  bool mDragSupported = false;
+  float mDropX = 0.f, mDropY = 0.f;
+  Window mTooltipWindow = 0;
+  XFontSet mTooltipFont = nullptr;
+  int mTooltipControl = -1;
+  float mTooltipX = 0.f, mTooltipY = 0.f;
+  unsigned long mTooltipHoverTime = 0;
+  bool mInputMethodDisconnected = false;
   std::atomic<bool> mTimerRunning{false};
 
   float mHiddenCursorX = 0.f;
   float mHiddenCursorY = 0.f;
   Cursor mBlankCursor = 0;  // cached invisible cursor for HideMouseCursor
   bool mNeedsRedraw = false;
+  bool mCloseRequested = false;
+  int mDispatchDepth = 0;
   unsigned long mLastLeftClickTime = 0;  // X11 server timestamp of last left-button press
+  float mLastLeftClickX = 0.f;
+  float mLastLeftClickY = 0.f;
 
   // Clipboard atoms (interned in OpenWindow)
   Atom mClipboardAtom = 0;
   Atom mUTF8StringAtom = 0;
-  Atom mTargetsAtom = 0;
   Atom mSelDataAtom = 0;
-  WDL_String mClipboardText;  // text we own as selection provider
 
   bool mHostDriven = false;        // set true before OpenWindow when host drives the event loop
   bool mInConfigureNotify = false; // suppress PlatformResize re-entry from ConfigureNotify
-  bool mInHostResize = false;      // suppress XResizeWindow during host-driven resize
-  bool mHostDidResize = false;     // set by OnEndHostResize; cleared by PlatformResize
 
-  // The physical size the host last passed via onSize → OnParentWindowResize.
-  // OnEndHostResize uses this to XResizeWindow to exactly the host's size,
-  // avoiding aspect-ratio drift from Scale mode's max(scaleX, scaleY).
-  unsigned mHostPhysW = 0;
-  unsigned mHostPhysH = 0;
-
-  // Last physical size we actually passed to XResizeWindow (or XCreateWindow).
-  // ConfigureNotify events for any other size are stale (from a superseded
-  // XResizeWindow request) and must be ignored to prevent mWidth from reverting.
-  unsigned mLastPhysW = 0;
-  unsigned mLastPhysH = 0;
-
-  void StartTimer();
+  bool StartTimer();
   void StopTimer();
 
   static void* TimerThreadProc(void* pParam);
   pthread_t mTimerThread = 0;
+  std::unique_ptr<Timer> mMainLoopTimer;
 };
 
 END_IGRAPHICS_NAMESPACE

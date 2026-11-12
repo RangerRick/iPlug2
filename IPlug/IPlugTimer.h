@@ -12,7 +12,7 @@
 #pragma once
 
 /** @file
- * @brief This file includes classes for implementing timers - in order to get a regular callback on the main thread
+ * @brief Platform timer primitives. Linux worker timers require explicit main-thread dispatch for UI work.
  * The interface is partially based on the api of Steinberg's timer.cpp from the VST3_SDK for compatibility,
  * base/source/timer.cpp, so thanks to them 
  * */
@@ -32,7 +32,7 @@
 #elif defined OS_WEB
 #include <emscripten/html5.h>
 #elif defined OS_LINUX
-#include <atomic>
+#include <memory>
 #include <pthread.h>
 #endif
 
@@ -47,6 +47,8 @@ struct Timer
   
   using ITimerFunction = std::function<void(Timer& t)>;
 
+  /** On Linux, callbacks run on a worker; returns nullptr if that worker cannot be created.
+   * A callback may stop or destroy its own timer. External Stop() waits for the worker to exit. */
   static Timer* Create(ITimerFunction func, uint32_t intervalMs);
   virtual ~Timer() {};
   virtual void Stop() = 0;
@@ -102,16 +104,16 @@ private:
 class Timer_impl : public Timer
 {
 public:
-  Timer_impl(ITimerFunction func, uint32_t intervalMs);
   ~Timer_impl();
   void Stop() override;
 
 private:
+  friend struct Timer;
+  Timer_impl(ITimerFunction func, uint32_t intervalMs);
+  bool Start();
   static void* ThreadProc(void* pParam);
-  ITimerFunction mTimerFunc;
-  uint32_t mIntervalMs;
-  std::atomic<bool> mRunning{false};
-  pthread_t mThread = 0;
+  struct State;
+  std::shared_ptr<State> mState;
 };
 #endif
 

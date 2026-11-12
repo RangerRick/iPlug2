@@ -84,10 +84,18 @@ function(_iplug_add_resources target resources)
   set_source_files_properties(${resources} PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources
   )
+  if(UNIX AND NOT EMSCRIPTEN)
+    # A resource-only edit must also run POST_BUILD deployment. On Apple the
+    # bundle copy rule alone need not relink; Linux copies resources after link.
+    # Keep that ordering by making the link depend on the resource inputs.
+    foreach(_res IN LISTS resources)
+      get_filename_component(_abs_res "${_res}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+      set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_abs_res}")
+    endforeach()
+  endif()
   if(UNIX AND NOT APPLE)
     # On Linux: copy resources so that IPlugPaths.cpp's LocateResource can find them.
-    #   APP (EXECUTABLE)       -> <bindir>/resources/<type>/<file>
-    #   CLAP (SHARED_LIBRARY, flat)   -> <libdir>/resources/<type>/<file>
+    #   Flat APP/CLAP targets -> <target-file>.resources/<type>/<file>
     #   VST3 (SHARED_LIBRARY, bundle) -> <libdir>/../Resources/<type>/<file>
     #                                    (i.e. Contents/Resources/ in the bundle)
     get_target_property(_target_type ${target} TYPE)
@@ -113,13 +121,14 @@ function(_iplug_add_resources target resources)
           set(_res_dest "${_outdir}/../Resources/${_type}/${_filename}")
           set(_res_dir  "${_outdir}/../Resources/${_type}")
         else()
-          set(_res_dest "${_outdir}/resources/${_type}/${_filename}")
-          set(_res_dir  "${_outdir}/resources/${_type}")
+          set(_res_dest "$<TARGET_FILE:${target}>.resources/${_type}/${_filename}")
+          set(_res_dir  "$<TARGET_FILE:${target}>.resources/${_type}")
         endif()
         add_custom_command(TARGET ${target} POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E make_directory "${_res_dir}"
           COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_abs_res}" "${_res_dest}"
-          COMMENT "Copying resource ${_filename} -> ${_res_dest}"
+          COMMENT "Copying resource ${_filename} for ${target}"
+          VERBATIM
         )
       endforeach()
     endif()
@@ -151,7 +160,7 @@ function(_iplug_create_desktop_targets plugin_name formats sources ui_lib resour
     iplug_add_target(${plugin_name}-app PUBLIC
       LINK iPlug2::APP ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-app APP ${plugin_name})
+    iplug_configure_target(${plugin_name}-app APP ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-app "${resources}")
     _iplug_add_web_resources(${plugin_name}-app "${web_resources}")
     iplug_deploy_target(${plugin_name}-app APP ${plugin_name})
@@ -163,19 +172,19 @@ function(_iplug_create_desktop_targets plugin_name formats sources ui_lib resour
     iplug_add_target(${plugin_name}-vst2 PUBLIC
       LINK iPlug2::VST2 ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-vst2 VST2 ${plugin_name})
+    iplug_configure_target(${plugin_name}-vst2 VST2 ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-vst2 "${resources}")
     _iplug_add_web_resources(${plugin_name}-vst2 "${web_resources}")
     iplug_deploy_target(${plugin_name}-vst2 VST2 ${plugin_name})
   endif()
 
-  # VST3 (always available)
-  if("VST3" IN_LIST formats)
+  # VST3 (conditional on SDK availability)
+  if("VST3" IN_LIST formats AND IPLUG2_VST3_SUPPORTED)
     add_library(${plugin_name}-vst3 MODULE ${sources})
     iplug_add_target(${plugin_name}-vst3 PUBLIC
       LINK iPlug2::VST3 ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-vst3 VST3 ${plugin_name})
+    iplug_configure_target(${plugin_name}-vst3 VST3 ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-vst3 "${resources}")
     _iplug_add_web_resources(${plugin_name}-vst3 "${web_resources}")
     iplug_deploy_target(${plugin_name}-vst3 VST3 ${plugin_name})
@@ -187,7 +196,7 @@ function(_iplug_create_desktop_targets plugin_name formats sources ui_lib resour
     iplug_add_target(${plugin_name}-clap PUBLIC
       LINK iPlug2::CLAP ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-clap CLAP ${plugin_name})
+    iplug_configure_target(${plugin_name}-clap CLAP ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-clap "${resources}")
     _iplug_add_web_resources(${plugin_name}-clap "${web_resources}")
     iplug_deploy_target(${plugin_name}-clap CLAP ${plugin_name})
@@ -199,7 +208,7 @@ function(_iplug_create_desktop_targets plugin_name formats sources ui_lib resour
     iplug_add_target(${plugin_name}-aax PUBLIC
       LINK iPlug2::AAX ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-aax AAX ${plugin_name})
+    iplug_configure_target(${plugin_name}-aax AAX ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-aax "${resources}")
     _iplug_add_web_resources(${plugin_name}-aax "${web_resources}")
     iplug_deploy_target(${plugin_name}-aax AAX ${plugin_name})
@@ -220,7 +229,7 @@ function(_iplug_create_au_targets plugin_name formats sources ui_lib resources w
     iplug_add_target(${plugin_name}-au PUBLIC
       LINK iPlug2::AUv2 ${ui_lib} ${base_lib}
     )
-    iplug_configure_target(${plugin_name}-au AUv2 ${plugin_name})
+    iplug_configure_target(${plugin_name}-au AUv2 ${plugin_name} DEFER_DEPLOYMENT)
     _iplug_add_resources(${plugin_name}-au "${resources}")
     _iplug_add_web_resources(${plugin_name}-au "${web_resources}")
     iplug_deploy_target(${plugin_name}-au AUv2 ${plugin_name})
@@ -409,6 +418,34 @@ function(_iplug_add_web_resources target resources)
     return()
   endif()
   target_sources(${target} PRIVATE ${resources})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(target MATCHES "-clap$")
+      set_property(TARGET ${target} PROPERTY IPLUG_LINUX_WEB_RESOURCES TRUE)
+    endif()
+    foreach(resource IN LISTS resources)
+      get_filename_component(_abs_path "${resource}" ABSOLUTE)
+      string(FIND "${_abs_path}" "/resources/web/" _web_pos)
+      if(_web_pos GREATER -1)
+        math(EXPR _start "${_web_pos} + 15")
+        string(SUBSTRING "${_abs_path}" ${_start} -1 _rel_path)
+      else()
+        get_filename_component(_rel_path "${resource}" NAME)
+      endif()
+      get_filename_component(_linux_web_subdir "${_rel_path}" DIRECTORY)
+      if(target MATCHES "-vst3$")
+        set(_linux_web_dir "$<TARGET_FILE_DIR:${target}>/../../Resources/web")
+      elseif(target MATCHES "-clap$")
+        set(_linux_web_dir "$<TARGET_FILE:${target}>.resources/web")
+      else()
+        set(_linux_web_dir "$<TARGET_FILE_DIR:${target}>/Resources/web")
+      endif()
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_linux_web_dir}/${_linux_web_subdir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_abs_path}"
+          "${_linux_web_dir}/${_rel_path}"
+        VERBATIM)
+    endforeach()
+  endif()
   foreach(resource ${resources})
     # Get the path relative to resources/web/ to preserve subdirectories
     get_filename_component(_abs_path "${resource}" ABSOLUTE)
@@ -511,6 +548,10 @@ macro(iplug_add_plugin plugin_name)
   endif()
 
   # Determine UI library and include necessary modules
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND "iPlug2::Extras::IWebViewControl" IN_LIST PLUGIN_LINK)
+    message(FATAL_ERROR "iplug_add_plugin(${plugin_name}): IWebViewControl is not implemented on Linux. Remove the WebView control and its LINK dependency.")
+  endif()
+
   if(PLUGIN_UI STREQUAL "IGRAPHICS")
     set(_iplug_ui_lib ${IGRAPHICS_LIB})
   elseif(PLUGIN_UI STREQUAL "WEBVIEW")

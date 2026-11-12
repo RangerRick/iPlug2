@@ -38,7 +38,7 @@ CMake and Ninja can be installed via:
 sudo apt-get install -y \
   ninja-build pkg-config \
   libfreetype-dev libfontconfig-dev \
-  libx11-dev libxi-dev libxext-dev libxrender-dev \
+  libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxext-dev libxrender-dev \
   libxrandr-dev libxfixes-dev libxcursor-dev \
   libgl-dev libgtk-3-dev \
   libasound2-dev libjack-jackd2-dev libpulse-dev
@@ -133,6 +133,260 @@ cmake --build . --config Release
 - AUv3 is embedded in the standalone APP on macOS
 - Linux uses X11, NanoVG/GL3, and ALSA/JACK for audio
 
+An absent or incomplete VST3 SDK disables automatic VST3 target creation, without
+preventing standalone builds. CMake reports the first missing SDK file and the
+download command. To install it, run `./download-vst3-sdk.sh` from
+`Dependencies/IPlug/`, then configure again.
+
+### Linux runtime regression tests
+
+These tests use a separate build directory and never deploy plugins to user/system
+scan paths or use an audio device. Deployment fixtures copy only inside the test
+build directory. The tests require `xvfb`, `xauth`, and Mesa's software renderer
+(`libgl1-mesa-dri` on Ubuntu/Debian), in addition to the Linux build dependencies.
+The host tests require the VST3 SDK, CLAP SDK, and CLAP helpers headers.
+The standard build targets below also build the GTK clipboard and core timer
+regression executables through target dependencies.
+
+```bash
+cmake -S Tests/Linux -B build/linux-regression -DCMAKE_BUILD_TYPE=Release
+cmake --build build/linux-regression --parallel 2 \
+  --target IPlugEffect-app LinuxGuiTest LinuxStartupHooks \
+  LinuxDialogTest LinuxRuntimeTest LinuxClapHostTest LinuxVst3HostTest LinuxOscTest
+ctest --test-dir build/linux-regression --output-on-failure
+```
+
+The CLAP/VST3 host fixtures also process known stereo input without an audio
+device, save and restore the gain parameter, and check output samples and buffer
+boundaries at 1, 64, 127 and 512 frames and 44.1/48 kHz. VST3 covers both 32-bit
+and 64-bit sample buffers; CLAP covers 32-bit buffers and partial state-stream
+reads/writes. Processing runs on a separate audio thread.
+
+Host-scale tests cover notification before attachment (and before the VST3
+frame), visible scale changes, fractional factors, invalid values, environment
+override priority, and CLAP hide/show. Click-focus tests route key events through
+the X server's current input focus rather than directly invoking a key handler.
+The GTK clipboard test owns the selection on the same UI thread as the editor
+and requests editor shutdown during a pending paste.
+
+Linux Ninja CI covers GCC x86_64, GCC ARM64 and Clang with ASan/UBSan. GL/GTK
+process-wide caches are excluded from leak checking; the core timer lifecycle
+test runs separately with leak detection enabled. Clang's Linux byte-swap
+compatibility is supplied by `IPlug/IPlugLinuxHeaders.h`, without changing WDL.
+Four timer-entry-point fault-injection cases run only in the GCC jobs: ASan
+substitutes its own pthread entry point, which prevents the injection shim from
+identifying the timer callback. The timer lifecycle tests still run under ASan.
+
+The suite checks repeated GUI startup, rendering and normal shutdown,
+main-loop timer/display initialization failures, ALSA error
+visibility, and missing/placeholder/incomplete/complete VST3 SDK detection.
+It also drives real GTK dialogs to check all message button sets, file open/save
+and directory selection, cancellation, reference outputs, callback results, and
+space-separated extension filters (with optional leading dots). A separate process
+checks safe cancellation when the optional GTK runtime cannot be loaded.
+Additional tests cover editor shutdown while the graphics mutex is held, core
+timer startup/failure and stopping, self-owned and external UTF-8/empty clipboards,
+and automatic/deferred deployment. A minimal CLAP host exercises absent, partial,
+and rejected timer/fd extensions, callback coalescing, GUI hide/show/destroy, and
+window/fallback-timer initialization failures.
+The deployment fixture also checks Linux REAPER extension `reaper_*.so` naming
+and deployment of web resources alongside the extension using an isolated path.
+Actual resource lookup is checked in separate processes for both COPY and SYMLINK
+deployment, including VST3 bundles and two flat plugins with different contents
+under the same resource filename. Missing resources must not resolve to another
+plugin, the host executable, or the legacy shared resource directory.
+Native X11 close events are tested with internal and host-driven event
+loops. Clipboard tests include two editors sharing one UI thread, an independent
+client pasting while the owner's main thread is blocked, and service startup failures.
+They also destroy requestor windows during transfers under both the default and
+a host-installed X11 error handler, then verify later replies and unrelated host
+errors still work.
+GLX probes keep a separate host context with distinct draw/read drawables current
+during editor initialization, rendering, resizing, reopening and teardown, and
+check restoration after failed activation. They also cover no current context
+and nested context scopes across two editors.
+Keyboard probes check host-delivered keys at normal, HiDPI and fractional UI
+scales, Latin-1/Unicode keys, local XIM Compose sequences, input-context teardown
+and reopening, and multi-character UTF-8 commits (including buffer-overflow retries).
+IME commits are split into code points to match `IKeyPress`; preedit UI is left to
+the input method. XIM uses the host's locale and modifiers without changing these
+process-wide settings. A UTF-8 host locale is recommended for Compose and IME.
+When no input context is available, a diagnostic is logged and basic key input
+still converts Latin-1/Unicode keysyms to UTF-8, without Compose or IME.
+Parent-window validation uses checked XCB replies and never replaces the host's
+process-wide X11 error handler. Tests cover valid, destroyed and out-of-range
+parent IDs, fallback parenting, and continued delivery of unrelated host errors.
+The VST3 host tests check real knob gestures and rendering on the host UI thread,
+run loops supplied by the frame or initialization context, missing/rejected
+registrations, frame replacement, native close, and editor reopening.
+Dedicated idle probes check main-thread callbacks before opening an editor, after
+closing it, and in builds without IGraphics. They also check queued UI messages,
+callback coalescing, timer initialization failures, and teardown.
+Close lifecycle probes check that `OnUIClose()` runs once on the main thread with
+live controls, including native close, later host teardown, reopening, and
+standalone graphics-timer initialization failure.
+Standalone input and drawing probes check the owning main thread, including a
+GTK dialog opened from an X11 button event and reentrant main-loop dispatch.
+A mock REAPER host uses real SWELL windows and timers to check idle delivery
+before/after editor use, main-thread drawing and host API calls, deferred docking
+and hiding from control callbacks, and timer teardown. It also checks the actual
+X11 parent chain and client-area geometry in floating and docked windows, after
+resizing, and recovery after bridge/editor initialization failures.
+Linux IGraphics REAPER extensions embed through `SWELL_CreateXBridgeWindow`,
+passing its X11 Window ID rather than a SWELL HWND to the editor. The bridge
+tracks the container's client area and supports docked SWELL children without
+their own native window. Bridge or editor initialization failure closes the
+container and logs an error instead of opening an unrelated top-level editor.
+Fault-injection hooks and exported executable symbols are confined to this test
+build. The Linux Ninja CI job runs this suite with software OpenGL under Xvfb.
+
+Linux file/directory dialogs update their reference outputs before invoking the
+completion handler and clear them on cancellation or failure. Selected directory
+paths end in `/`; directory callbacks leave the filename argument empty and put
+the result in the path argument. Message boxes return `kCANCEL` and log an error
+when GTK is unavailable, rather than approving the action.
+
+Standalone and REAPER extension graphics timers use the SWELL main loop at the
+editor's configured frame rate. Input, drawing, GTK dialogs and control actions
+therefore run on the owning main thread rather than a graphics worker.
+Nested main-loop dispatch skips graphics callbacks already in progress.
+Standalone SWELL is built with GTK event forwarding so opening a GTK dialog does
+not replace the application's event handler. Container close/quit is completed
+by the outer standalone main loop, never inside a modal callback.
+Editor close requests made inside input/drawing callbacks are completed only
+after dispatch returns; REAPER docking/hiding actions are deferred the same way.
+REAPER idle dispatch starts only after host API imports are complete, uses a
+SWELL main-loop timer even without an editor, and stops before extension teardown.
+
+Linux drawing skips a timer tick when the graphics mutex is busy, so editor
+teardown can join the drawing thread without a lock inversion. Core timer creation
+logs an error and returns `nullptr` if the worker cannot be created.
+Linux graphics context scopes restore the calling thread's previous GLX display,
+context and draw/read drawables, including nested resource creation and teardown,
+instead of clearing the host's current context.
+
+VST3 editors use the host's Linux `IRunLoop` for X11 input and drawing. The run loop
+must be available through the frame or initialization context and accept a GUI
+timer; otherwise editor attachment fails explicitly rather than using a worker
+thread for VST3 UI notifications. FD registration is optional because timer ticks
+also poll X11. Registrations are released before the editor or frame is replaced.
+The core idle/message timer is separate from the editor timer and remains active
+until plugin termination. It uses the initialization context's run loop, or retains
+the first usable frame run loop if the context does not provide one. If neither
+provides a usable run loop, idle dispatch is unavailable and a diagnostic is logged;
+it never falls back to calling UI or host code on a worker thread.
+
+CLAP uses host timers when available. If timer support is missing or registration
+fails, a private timer requests coalesced `on_main_thread` callbacks; X11 event
+handling and rendering still run on the host's main thread. Host fd support is
+optional because GUI ticks also poll X11. All registrations and fallback workers
+are released when the GUI is hidden or destroyed and recreated when shown again.
+Native close events also release VST3/CLAP GUI registrations before reopening.
+X11 close events only record a request and stop drawing. VST3/CLAP complete it
+after graphics dispatch returns, unregistering GUI callbacks before closing through
+the editor delegate. Standalone completes the request on its SWELL idle timer.
+REAPER extensions use their SWELL idle timer to complete the request and
+close their container on the host main thread.
+This keeps controls alive during `OnUIClose()` and avoids destroying a graphics
+object from its own worker or event-processing stack. Repeated host close calls
+do not repeat the callback.
+CLAP core idle/message delivery uses separate coalesced `on_main_thread` requests,
+including when the editor is hidden, destroyed, or absent. Its worker only requests
+host callbacks and is joined before the CLAP host proxy is destroyed. Initialization
+fails explicitly if this worker cannot be created. Standalone idle/message delivery
+uses the SWELL main-loop timer rather than a worker.
+
+Clipboard ownership uses a dedicated X11 connection and worker, so selection
+requests do not depend on either plugin's UI loop being dispatched. Text remains
+available after an editor closes while its module is loaded. Failure to open the
+clipboard connection or start its worker is logged and reported to the caller.
+Clipboard replies use checked XCB requests on that dedicated connection. A paste
+target disappearing during a transfer cancels the reply without invoking the
+host's X11 error handler or replacing that handler process-wide.
+Synchronous paste also services pending GTK events so that a host clipboard
+owner on the same UI thread can answer. Editor close requests during this wait
+are deferred until paste returns; a close cancels the wait.
+Linux resource lookup resolves module symlinks before searching adjacent resources.
+Flat binaries use an adjacent, binary-specific directory such as
+`MyPlugin.clap.resources/ttf/Roboto-Regular.ttf` or
+`MyPlugin.resources/ttf/Roboto-Regular.ttf` for a standalone app. COPY deployment
+copies only that binary's resource directory; SYMLINK deployment finds resources
+beside the resolved binary. When installing manually, keep the binary and its
+`.resources` directory together. VST3 keeps the existing `Contents/Resources/`
+bundle layout. The old shared `resources/` directory is no longer searched:
+rebuild and redeploy Linux binaries to populate the isolated directories.
+Resource inputs are link dependencies on Linux and macOS, so a resource-only
+edit also runs post-build deployment. Linux deployment tests exercise both
+Ninja and Make, flat files and VST3 bundles, and COPY/SYMLINK deployment, using
+mutable inputs inside the test build directory.
+
+For interactive standalone testing, `IPlugEffect --no-io` opens only the editor.
+Linux preserves ALSA diagnostics; audio startup failures leave the editor available
+for changing audio settings, while window/editor startup failures return a nonzero
+exit status. Native Linux requires a working ALSA device or JACK server. On WSLg,
+an installed JACK client library alone does not provide a server or a route to
+Windows audio; that routing must be configured separately.
+
+#### Validation before an upstream merge
+
+Xvfb and the small host fixtures do not replace interactive DAW testing. Record
+the host/version, display server, GPU/driver and display scale when checking:
+
+- Multiple instances, repeated editor opening, docking, and project reload.
+- Host-to-editor and editor-to-host keyboard focus, Compose/IME input, and GTK
+  dialog focus restoration.
+- XWayland and movement between monitors with different display scales.
+- Real ALSA/JACK audio, device changes, processing restart, and state restore.
+
+These interactive cases, Windows execution and hardware GPU behavior have not
+been established by the headless Linux regression suite. Native Wayland and
+Skia remain outside the implemented Linux support scope. The separate WebKitGTK
+editor backend still needs interactive DAW validation.
+
+The Linux-support diff also contains two existing vendored patches that should
+be reviewed separately from the platform implementation: SWELL INI writes now
+report file/flush/rename failures through their return values, and NanoVG's
+packed depth/stencil fallback uses the combined framebuffer attachment. Keep
+their reproduction evidence and macOS/Windows validation with those patches;
+Linux software-GL success alone does not establish cross-platform correctness.
+
+### Linux OSC polling
+
+Linux OSC does not create a worker timer. Call `ProcessOSC()` regularly from the
+owning main thread, typically from the plugin's `OnIdle()`. When inheriting both
+OSC interfaces, poll both:
+
+```cpp
+void MyPlugin::OnIdle()
+{
+  OSCSender::ProcessOSC();
+  OSCReceiver::ProcessOSC();
+}
+```
+
+All OSC operations, including sending, changing destinations or receive ports,
+setting log callbacks, and destruction must use that same thread. Received
+messages call `OnOSCMessage()` synchronously during polling; no receive callback runs
+during construction or after destruction. A receive callback may change ports or
+destinations, but must not destroy its OSC interface. Recursive polling is ignored
+until the current tick finishes. Polling and socket operations are not
+realtime-safe and must not run in `ProcessBlock()`. macOS and Windows retain their
+existing automatic main-thread timers; they do not require manual polling.
+
+The socket regression tests check explicit send/receive polling, callback thread
+identity, device replacement/removal, recursive polling, and destruction/reopening.
+They can also run without the GUI dependencies:
+
+```bash
+cmake -S Tests/Linux/OSC -B build/linux-osc -DCMAKE_BUILD_TYPE=Release
+cmake --build build/linux-osc
+ctest --test-dir build/linux-osc --output-on-failure
+```
+
+On macOS this exercises the Linux OSC polling code using macOS sockets, and also
+checks that the native automatic timer still delivers messages. This is not a
+substitute for running the suite on Linux.
+
 ## Build Commands
 
 ### Build All Targets
@@ -184,8 +438,8 @@ cmake -G Ninja -DIPLUG2_UNIVERSAL=ON ..
 # Or set architectures directly
 cmake -G Ninja -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" ..
 
-# Deployment target (default: 10.13)
-cmake -G Ninja -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 ..
+# Deployment target (default: 13.0)
+cmake -G Ninja -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 ..
 ```
 
 ### Windows Options
@@ -366,7 +620,7 @@ iplug_add_plugin(<name>
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `SOURCES` | Source files (.cpp, .h, .mm) | Required |
-| `RESOURCES` | Bundle resources (fonts, images) - goes into `Resources/` | None |
+| `RESOURCES` | Fonts/images in bundle `Resources/`, or a binary-specific `.resources/` directory for flat Linux binaries | None |
 | `WEB_RESOURCES` | Web UI files (HTML, JS, CSS) - goes into `Resources/web/` | None |
 | `FORMATS` | Target formats to build | `ALL` |
 | `EXCLUDE_FORMATS` | Formats to exclude | None |
@@ -576,6 +830,11 @@ Plugins are automatically deployed (symlinked or copied) to standard locations:
 
 ### Deployment Options
 
+`iplug_configure_target()` retains automatic deployment for directly configured
+targets. When adding resources after configuration, pass `DEFER_DEPLOYMENT` and
+call `iplug_deploy_target()` after adding the resources. `iplug_add_plugin()` does
+this automatically so deployment runs once, after resource copying.
+
 ```bash
 # Disable automatic deployment
 cmake -G Ninja -DIPLUG_DEPLOY_PLUGINS=OFF ..
@@ -675,7 +934,65 @@ emrun --no_emrun_detect index.html
 - Plugins are deployed to `~/.vst3/` (VST3) and `~/.clap/` (CLAP) by default
 - Both Ninja and Unix Makefiles generators work (`linux-ninja` and `linux-make` presets)
 - `pkg-config` is used to find system libraries (freetype, fontconfig, X11, GTK3, ALSA, etc.)
-- The Skia backend is not yet supported on Linux; use NanoVG
+- NanoVG/GL3 remains the default. For Skia/GL3, run
+  `Dependencies/IGraphics/build-skia-linux.sh` to build the pinned Skia
+  `chrome/m130` revision. This installs headers and matching static libraries
+  below `Dependencies/Build/linux` (or set `IPLUG_SKIA_LINUX_DIR` to an
+  alternative installation directory for both the script and CMake).
+  Required archives: `libskia.a`, `libsvg.a`, `libskparagraph.a`,
+  `libskshaper.a`, `libskunicode_core.a`, `libskunicode_icu.a`.
+  Build with `-DIGRAPHICS_BACKEND=SKIA -DIGRAPHICS_RENDERER=GL3`.
+  For example, on a Linux machine with Ninja, Python 3, Git and development
+  headers for Fontconfig, Expat and FreeType installed:
+
+  ```bash
+  Dependencies/IGraphics/build-skia-linux.sh
+  cmake -S Tests/Linux -B build/linux-skia -G Ninja \
+    -DIGRAPHICS_BACKEND=SKIA -DIGRAPHICS_RENDERER=GL3
+  cmake --build build/linux-skia
+  ctest --test-dir build/linux-skia --output-on-failure
+  ```
+
+  Skia/CPU presentation is not implemented on Linux. Skia/GL3 passes the
+  Linux Xvfb regression suite with a software OpenGL renderer; real DAW and
+  hardware GPU testing is still required.
+- `UI WEBVIEW` on Linux uses WebKitGTK 4.1 and an X11 `GtkPlug` editor.
+  Install `libwebkit2gtk-4.1-dev` before configuring a WebView plugin;
+  it is not required for other Linux plugins. `WEB_RESOURCES` are staged in
+  `<name>.clap.resources/web` alongside CLAP binaries, or in the VST3 bundle's
+  `Resources/web`. Deploy the CLAP binary together with its `.resources` folder.
+  The root examples build skips WebView examples unless
+  `-DIPLUG_LINUX_WEBVIEW_EXAMPLES=ON` is set. Embedded
+  `IWebViewControl` (including IPlugOSCEditor) and the REAPER WebView extension
+  remain unsupported on Linux. The backend currently does not implement custom
+  URL schemes, downloads, or the optional scroll toggle. It runs GTK events on
+  the host main thread via CLAP callbacks or the VST3 idle run loop; interactive
+  DAW, XWayland, focus/IME, and multi-instance testing is still required.
+  Xvfb in restricted containers may also require disabling the WebKit sandbox
+  for *tests only*; do not set that override in a production host.
+
+The optional WebView editor regression tests require WebKitGTK 4.1:
+
+```bash
+cmake -S Tests/Linux -B build/linux-webview -G Ninja \
+  -DIPLUG_LINUX_WEBVIEW_EDITOR_TEST=ON
+cmake --build build/linux-webview --target LinuxClapHostTest LinuxVst3HostTest
+ctest --test-dir build/linux-webview -R '^linux-webview-(editor|vst3)$' --output-on-failure
+```
+
+An optional X11 embedding feasibility test is available on machines with
+`libwebkit2gtk-4.1-dev` installed:
+
+```bash
+cmake -S Tests/Linux -B build/linux-webkit-probe -G Ninja \
+  -DIPLUG_LINUX_WEBKIT_EMBED_PROBE=ON
+cmake --build build/linux-webkit-probe --target LinuxWebKitEmbedProbe
+ctest --test-dir build/linux-webkit-probe -R '^linux-webkit-embed$' --output-on-failure
+```
+
+This standalone probe predates the plugin integration. It embeds a GTK3
+`GtkPlug` containing a WebKitGTK view in a raw X11 parent; unlike the editor
+regression tests above, it does not load an iPlug2 plugin.
 
 ## Troubleshooting
 

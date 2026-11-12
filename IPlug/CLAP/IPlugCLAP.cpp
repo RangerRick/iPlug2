@@ -15,6 +15,9 @@
 #include "IPlugPluginBase.h"
 #include "plugin.hxx"
 #include "host-proxy.hxx"
+#if defined OS_LINUX && defined WEBVIEW_EDITOR_DELEGATE
+extern "C" void IPlugLinuxWebViewPump();
+#endif
 #ifndef NO_IGRAPHICS
   #if defined OS_LINUX
     #include "IGraphicsLinux.h"
@@ -60,7 +63,22 @@ IPlugCLAP::IPlugCLAP(const InstanceInfo& info, const Config& config)
   mAudioIO64.Resize(nChans);
   
   SetHost(info.mHost->name, version);
+#ifndef OS_LINUX
   CreateTimer();
+#endif
+}
+
+IPlugCLAP::~IPlugCLAP()
+{
+#ifdef OS_LINUX
+#if defined WEBVIEW_EDITOR_DELEGATE
+  mWebViewTimer.reset();
+#endif
+  mTimer.reset();
+#ifndef NO_IGRAPHICS
+  mLinuxGuiTimer.reset();
+#endif
+#endif
 }
 
 uint32_t IPlugCLAP::tailGet() const noexcept
@@ -100,7 +118,7 @@ bool IPlugCLAP::EditorResize(int viewWidth, int viewHeight)
 {
   if (HasUI())
   {
-    if (viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight())
+    if ((viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight()) && GetClapHost().canUseGui())
     {
       GetClapHost().guiRequestResize(viewWidth, viewHeight);
     }
@@ -157,7 +175,18 @@ bool IPlugCLAP::SendSysEx(const ISysEx& msg)
 bool IPlugCLAP::init() noexcept
 {
   SetDefaultConfig();
-  
+
+#ifdef OS_LINUX
+  mTimer.reset(Timer::Create([this](Timer&) {
+    if (!mLinuxIdlePending.exchange(true))
+      _host.requestCallback();
+  }, IDLE_TIMER_RATE));
+  if (!mTimer)
+  {
+    fprintf(stderr, "Could not start the CLAP idle callback timer\n");
+    return false;
+  }
+#endif
   return true;
 }
 
@@ -908,11 +937,19 @@ bool IPlugCLAP::implementsGui() const noexcept
 
 bool IPlugCLAP::guiCreate(const char* api, bool isFloating) noexcept
 {
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+  return HasUI() && guiIsApiSupported(api, isFloating) && PrepareGraphics();
+#else
   return HasUI();
+#endif
 }
 
 void IPlugCLAP::guiDestroy() noexcept
 {
+#if defined OS_LINUX && defined WEBVIEW_EDITOR_DELEGATE
+  mWebViewTimer.reset();
+  mWebViewPending = false;
+#endif
 #if defined OS_LINUX && !defined NO_IGRAPHICS
   UnregisterLinuxHostCallbacks();
 #endif
@@ -923,19 +960,39 @@ void IPlugCLAP::guiDestroy() noexcept
 
 bool IPlugCLAP::guiShow() noexcept
 {
+#if defined OS_LINUX && (defined WEBVIEW_EDITOR_DELEGATE || !defined NO_IGRAPHICS)
+  return HasUI() && (mGUIOpen || (mWindow && GUIWindowAttach(mWindow)));
+#else
   if (HasUI() && !mGUIOpen)
   {
+#ifdef OS_LINUX
+    if (!OpenWindow(mWindow))
+    {
+      fprintf(stderr, "Could not show the CLAP editor\n");
+      CloseWindow();
+      return false;
+    }
+#else
     OpenWindow(mWindow);
+#endif
     return true;
   }
   else
   {
     return false;
   }
+#endif
 }
 
 bool IPlugCLAP::guiHide() noexcept
 {
+#if defined OS_LINUX && defined WEBVIEW_EDITOR_DELEGATE
+  mWebViewTimer.reset();
+  mWebViewPending = false;
+#endif
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+  UnregisterLinuxHostCallbacks();
+#endif
   if (HasUI())
   {
     CloseWindow();
@@ -955,6 +1012,9 @@ bool IPlugCLAP::guiCanResize() const noexcept
 
 bool IPlugCLAP::guiSetScale(double scale) noexcept
 {
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+  return HasUI() && SetHostScreenScale(static_cast<float>(scale));
+#else
   if (HasUI())
   {
     SetScreenScale(static_cast<float>(scale));
@@ -964,6 +1024,7 @@ bool IPlugCLAP::guiSetScale(double scale) noexcept
   {
     return false;
   }
+#endif
 }
 
 bool IPlugCLAP::guiGetSize(uint32_t* pWidth, uint32_t* pHeight) noexcept
@@ -987,14 +1048,38 @@ bool IPlugCLAP::GUIWindowAttach(void* pWindow) noexcept
 {
   if (HasUI())
   {
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+    UnregisterLinuxHostCallbacks();
+#endif
+#ifdef OS_LINUX
+    if (!OpenWindow(pWindow))
+    {
+      fprintf(stderr, "Could not attach the CLAP editor\n");
+      CloseWindow();
+      mGUIOpen = false;
+      return false;
+    }
+#else
     OpenWindow(pWindow);
+#endif
     mWindow = pWindow;
     mGUIOpen = true;
+#if defined OS_LINUX && defined WEBVIEW_EDITOR_DELEGATE
+    mWebViewTimer.reset(Timer::Create([this](Timer&) {
+      if (!mWebViewPending.exchange(true)) _host.requestCallback();
+    }, 16));
+    if (!mWebViewTimer) { CloseWindow(); mGUIOpen = false; return false; }
+#endif
 #if defined OS_LINUX && !defined NO_IGRAPHICS
     // Switch to host-driven mode: stops the internal timer thread
     // and lets the host drive rendering via onTimer / onPosixFd.
     static_cast<IGraphicsLinux*>(GetUI())->SetHostDriven(true);
-    RegisterLinuxHostCallbacks();
+    if (!RegisterLinuxHostCallbacks())
+    {
+      CloseWindow();
+      mGUIOpen = false;
+      return false;
+    }
 #endif
     return true;
   }
@@ -1041,23 +1126,30 @@ bool IPlugCLAP::guiAdjustSize(uint32_t* pWidth, uint32_t* pHeight) noexcept
   {
     int w = *pWidth;
     int h = *pHeight;
-    ConstrainEditorResize(w, h);
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+    if (GetUI())
+      static_cast<IGraphicsLinux*>(GetUI())->ConstrainHostResize(w, h);
+    else
+#endif
+    {
+      ConstrainEditorResize(w, h);
 
 #ifndef NO_IGRAPHICS
-    // In Scale mode, enforce the design aspect ratio so the host
-    // doesn't allow sizes that would clip the top/bottom or sides.
-    if (GetUI() &&
-        GetUI()->GetResizerMode() == EUIResizerMode::Scale)
-    {
-      const int logW = GetEditorWidth();
-      const int logH = GetEditorHeight();
-      const float scaleX = static_cast<float>(w) / logW;
-      const float scaleY = static_cast<float>(h) / logH;
-      const float scale = std::min(scaleX, scaleY);
-      w = static_cast<int>(logW * scale);
-      h = static_cast<int>(logH * scale);
-    }
+      // In Scale mode, enforce the design aspect ratio so the host
+      // doesn't allow sizes that would clip the top/bottom or sides.
+      if (GetUI() &&
+          GetUI()->GetResizerMode() == EUIResizerMode::Scale)
+      {
+        const int logW = GetEditorWidth();
+        const int logH = GetEditorHeight();
+        const float scaleX = static_cast<float>(w) / logW;
+        const float scaleY = static_cast<float>(h) / logH;
+        const float scale = std::min(scaleX, scaleY);
+        w = static_cast<int>(logW * scale);
+        h = static_cast<int>(logH * scale);
+      }
 #endif
+    }
 
     *pWidth = w;
     *pHeight = h;
@@ -1178,42 +1270,113 @@ uint32_t IPlugCLAP::NChannels(ERoute direction, uint32_t bus) const
 #if defined OS_LINUX && !defined NO_IGRAPHICS
 void IPlugCLAP::onTimer(clap_id timerId) noexcept
 {
-  if (timerId == mLinuxTimerId)
+  if (mGUIOpen && timerId != CLAP_INVALID_ID && timerId == mLinuxTimerId)
     if (auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI()))
+    {
       pGraphics->OnDisplayTimer();
+      CheckLinuxGuiClosed();
+    }
 }
 
 void IPlugCLAP::onPosixFd(int fd, clap_posix_fd_flags_t flags) noexcept
 {
-  if (auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI()))
-    pGraphics->ProcessX11Events();
+  if (mGUIOpen && fd == mLinuxFd && (flags & CLAP_POSIX_FD_READ))
+  {
+    std::lock_guard<std::recursive_mutex> lock(GfxMutex());
+    if (auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI()))
+      pGraphics->ProcessX11Events();
+    CheckLinuxGuiClosed();
+  }
 }
 
-void IPlugCLAP::RegisterLinuxHostCallbacks() noexcept
+#endif
+
+#if defined OS_LINUX
+void IPlugCLAP::onMainThread() noexcept
 {
-  if (!HasUI())
-    return;
+#if defined WEBVIEW_EDITOR_DELEGATE
+  mWebViewPending = false;
+  if (mGUIOpen) IPlugLinuxWebViewPump();
+#endif
+  if (mLinuxIdlePending.exchange(false))
+    OnTimer();
+#ifndef NO_IGRAPHICS
+  if (mLinuxCallbackPending.exchange(false) && mGUIOpen)
+    if (auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI()))
+    {
+      pGraphics->OnDisplayTimer();
+      CheckLinuxGuiClosed();
+    }
+#endif
+}
+#endif
+
+#if defined OS_LINUX && !defined NO_IGRAPHICS
+void IPlugCLAP::CheckLinuxGuiClosed() noexcept
+{
   auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI());
+  if (!pGraphics || pGraphics->WindowCloseRequested() || !pGraphics->WindowIsOpen())
+  {
+    UnregisterLinuxHostCallbacks();
+    mGUIOpen = false;
+    CloseWindowIfRequested();
+  }
+}
+
+bool IPlugCLAP::RegisterLinuxHostCallbacks() noexcept
+{
+  auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI());
+  if (!pGraphics || !pGraphics->WindowIsOpen())
+    return false;
+
   const int fd = pGraphics->GetX11Fd();
-  if (fd >= 0)
-    _host.posixFdSupportRegister(fd, CLAP_POSIX_FD_READ);
-  const uint32_t periodMs = static_cast<uint32_t>(1000.0 / pGraphics->FPS());
-  _host.timerSupportRegister(periodMs, &mLinuxTimerId);
+  if (fd >= 0 && _host.canUsePosixFdSupport())
+  {
+    if (_host.posixFdSupportRegister(fd, CLAP_POSIX_FD_READ))
+      mLinuxFd = fd;
+    else
+      fprintf(stderr, "CLAP host rejected the X11 file descriptor; polling on GUI ticks\n");
+  }
+  const uint32_t periodMs = std::max(1u, static_cast<uint32_t>(1000.0 / pGraphics->FPS()));
+  if (_host.canUseTimerSupport())
+  {
+    clap_id timerId = CLAP_INVALID_ID;
+    if (_host.timerSupportRegister(periodMs, &timerId) && timerId != CLAP_INVALID_ID)
+    {
+      mLinuxTimerId = timerId;
+      return true;
+    }
+  }
+
+  fprintf(stderr, "CLAP host timer unavailable; requesting main-thread GUI callbacks instead\n");
+  mLinuxGuiTimer.reset(Timer::Create([this](Timer&) {
+    if (!mLinuxCallbackPending.exchange(true))
+      _host.requestCallback();
+  }, periodMs));
+  if (!mLinuxGuiTimer)
+  {
+    fprintf(stderr, "Could not start the CLAP main-thread callback timer\n");
+    UnregisterLinuxHostCallbacks();
+    return false;
+  }
+  return true;
 }
 
 void IPlugCLAP::UnregisterLinuxHostCallbacks() noexcept
 {
+  mLinuxGuiTimer.reset();
+  mLinuxCallbackPending = false;
   if (mLinuxTimerId != CLAP_INVALID_ID)
   {
-    _host.timerSupportUnregister(mLinuxTimerId);
+    if (!_host.timerSupportUnregister(mLinuxTimerId))
+      fprintf(stderr, "Could not unregister the CLAP GUI timer\n");
     mLinuxTimerId = CLAP_INVALID_ID;
   }
-  if (HasUI())
+  if (mLinuxFd >= 0)
   {
-    auto* pGraphics = static_cast<IGraphicsLinux*>(GetUI());
-    const int fd = pGraphics->GetX11Fd();
-    if (fd >= 0)
-      _host.posixFdSupportUnregister(fd);
+    if (!_host.posixFdSupportUnregister(mLinuxFd))
+      fprintf(stderr, "Could not unregister the CLAP X11 file descriptor\n");
+    mLinuxFd = -1;
   }
 }
 #endif

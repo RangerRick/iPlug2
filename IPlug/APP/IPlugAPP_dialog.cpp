@@ -25,6 +25,8 @@ extern bool SaveWindowScreenshot(HWND hwnd, const char* path);
 extern "C" bool SaveWindowScreenshot(void* hwnd, const char* path);
 #elif defined OS_LINUX
 #include <unistd.h>
+#include <sys/wait.h>
+#include <cerrno>
 #define GET_MENU() GetMenu(gHWND)
 static bool SaveWindowScreenshot(HWND, const char*) { return false; }
 #endif
@@ -39,6 +41,7 @@ using namespace igraphics;
 #define IDT_SCREENSHOT_TIMER 1001
 #ifdef OS_LINUX
 #define WM_USER_OPENWINDOW (WM_USER + 1)
+#define IDT_OPENWINDOW_TIMER 1002
 static bool sPlugWindowOpen = false; // guards WM_SIZE before plugin window is ready
 #endif
 
@@ -497,10 +500,23 @@ WDL_DLGRET IPlugAPPHost::PreferencesDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wPar
             }
             #elif defined OS_LINUX
             {
+              // Double-fork so the launched process is reparented to init and the
+              // intermediate child is reaped here — no zombie accumulation.
               pid_t pid = fork();
-              if (pid == 0) {
-                execlp("xdg-open", "xdg-open", "https://alsa-project.org", nullptr);
-                _exit(127);
+              if (pid == 0)
+              {
+                pid_t grandchild = fork();
+                if (grandchild == 0)
+                {
+                  execlp("xdg-open", "xdg-open", "https://alsa-project.org", (char*)nullptr);
+                  _exit(127);
+                }
+                _exit(grandchild > 0 ? 0 : 1);
+              }
+              if (pid > 0)
+              {
+                int status;
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
               }
             }
             #endif
@@ -580,7 +596,7 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 
 #ifdef OS_LINUX
       // On Linux, show the dialog but don't resize or open the window yet.
-      // main() calls SetMenu first, then posts WM_USER_OPENWINDOW which
+      // main() attaches any menu first, then posts WM_USER_OPENWINDOW which
       // triggers ClientResize + OpenWindow so the SWELL layout includes
       // the menu bar before the plugin window is created.
       ShowWindow(hwndDlg, SW_SHOW);
@@ -614,21 +630,33 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
       // Posted from main() after SetMenu. Use a short timer to let the
       // GDK event loop process the SetMenu resize before we size and
       // open the plugin window.
-      SetTimer(hwndDlg, 0xF00D, 50, nullptr);
+      if (!sPlugWindowOpen && !SetTimer(hwndDlg, IDT_OPENWINDOW_TIMER, 50, nullptr))
+      {
+        fprintf(stderr, "Could not schedule standalone editor initialization\n");
+        gStandaloneExitStatus = EXIT_FAILURE;
+        DestroyWindow(hwndDlg);
+      }
       return 0;
     }
 #endif
     case WM_TIMER:
     {
 #ifdef OS_LINUX
-      if (wParam == 0xF00D)
+      if (wParam == IDT_OPENWINDOW_TIMER)
       {
-        KillTimer(hwndDlg, 0xF00D);
+        KillTimer(hwndDlg, IDT_OPENWINDOW_TIMER);
+        if (sPlugWindowOpen)
+          return 0;
         IPlugAPP* pPlug2 = pAppHost->GetPlug();
         ClientResize(hwndDlg, pPlug2->GetEditorWidth(),
                      pPlug2->GetEditorHeight());
         if (!pAppHost->OpenWindow(gHWND))
-          DBGMSG("couldn't attach gui\n");
+        {
+          fprintf(stderr, "Could not attach the standalone editor\n");
+          gStandaloneExitStatus = EXIT_FAILURE;
+          DestroyWindow(hwndDlg);
+          return 0;
+        }
         sPlugWindowOpen = true;
         return 0;
       }
@@ -640,7 +668,11 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
         SaveWindowScreenshot(gHWND, pAppHost->GetScreenshotPath());
 
         // Exit the application
+#ifdef OS_LINUX
+        gStandaloneCloseRequested = true;
+#else
         DestroyWindow(hwndDlg);
+#endif
         return 0;
       }
       break;
@@ -662,14 +694,22 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 
       return 0;
     case WM_CLOSE:
+#ifdef OS_LINUX
+      gStandaloneCloseRequested = true;
+#else
       DestroyWindow(hwndDlg);
+#endif
       return 0;
     case WM_COMMAND:
       switch (LOWORD(wParam))
       {
         case ID_QUIT:
         {
+#ifdef OS_LINUX
+          gStandaloneCloseRequested = true;
+#else
           DestroyWindow(hwndDlg);
+#endif
           return 0;
         }
         case ID_ABOUT:

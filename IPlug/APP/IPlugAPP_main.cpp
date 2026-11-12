@@ -530,24 +530,21 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
 #pragma mark - LINUX
 #elif defined(OS_LINUX)
 #include "IPlugSWELL.h"
-#include "swell-internal.h"
-#include <alsa/asoundlib.h>
 
 #define WM_USER_OPENWINDOW (WM_USER + 1)
 
 HWND gHWND;
 HINSTANCE gHINSTANCE;
+int gStandaloneExitStatus = EXIT_SUCCESS;
+bool gStandaloneCloseRequested = false;
 
 static bool gNoIO = false;
 
-// Suppress "Invalid CTL pulse" spam: ALSA probes the PulseAudio ALSA plugin
-// during library initialisation even when PulseAudio isn't running.
-static void _silentAlsaErrorHandler(const char*, int, const char*, int, const char*, ...) {}
-
 int main(int argc, char** argv)
 {
-  snd_lib_error_set_handler(_silentAlsaErrorHandler);
   SWELL_initargs(&argc, &argv);
+  // Let SWELL forward events to GTK dialogs while retaining its own GDK event handler.
+  SWELL_ExtendedAPI("LOAD_GTK", nullptr);
   SWELL_Internal_PostMessage_Init();
   SWELL_ExtendedAPI("APPNAME", (void*) BUNDLE_NAME);
 
@@ -563,32 +560,51 @@ int main(int argc, char** argv)
   if (gNoIO)
     pAppHost->SetNoIO(true);
 
-  pAppHost->Init();
-  pAppHost->TryToChangeAudio();
+  if (!pAppHost->Init())
+  {
+    fprintf(stderr, "Standalone initialization failed; audio and editor startup cancelled\n");
+    return 1;
+  }
+  if (!pAppHost->TryToChangeAudio())
+    fprintf(stderr, "Audio startup failed; check the standalone audio settings\n");
 
   HMENU menu = LoadMenu(NULL, MAKEINTRESOURCE(IDR_MENU1));
-  CreateDialog(gHINSTANCE, MAKEINTRESOURCE(IDD_DIALOG_MAIN), NULL, IPlugAPPHost::MainDlgProc);
-
-  if (gHWND && menu)
+  if (!CreateDialog(gHINSTANCE, MAKEINTRESOURCE(IDD_DIALOG_MAIN), NULL, IPlugAPPHost::MainDlgProc))
   {
-    SetMenu(gHWND, menu);
-#ifdef OS_LINUX
-    // Now that the menu bar is attached, post WM_USER_OPENWINDOW so the
-    // event loop can process the GDK resize before ClientResize + OpenWindow.
-    PostMessage(gHWND, WM_USER_OPENWINDOW, 0, 0);
-#endif
+    fprintf(stderr, "Could not create the standalone window\n");
+    return EXIT_FAILURE;
   }
 
-  while (gHWND && !gHWND->m_hashaddestroy)
+  if (menu)
+  {
+    SetMenu(gHWND, menu);
+  }
+  else
+    fprintf(stderr, "Standalone menu could not be loaded; opening the editor without it\n");
+
+  // Let the event loop process the optional menu resize before opening the editor.
+  if (!PostMessage(gHWND, WM_USER_OPENWINDOW, 0, 0))
+  {
+    fprintf(stderr, "Could not schedule standalone editor startup\n");
+    DestroyWindow(gHWND);
+    return EXIT_FAILURE;
+  }
+
+  while (gHWND)
   {
     SWELL_RunMessageLoop();
+    if (gStandaloneCloseRequested && gHWND)
+    {
+      gStandaloneCloseRequested = false;
+      DestroyWindow(gHWND);
+    }
     Sleep(10);
   }
 
   if (gHWND)
     DestroyWindow(gHWND);
 
-  return 0;
+  return gStandaloneExitStatus;
 }
 
 INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
@@ -603,6 +619,9 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
 #define SWELL_DLG_FLAGS_AUTOGEN SWELL_DLG_WS_FLIPPED|SWELL_DLG_WS_RESIZABLE
 #endif
 #include "swell-dlggen.h"
+#ifndef SWELL_DLG_WS_DEFAULT_SCALING
+#define SWELL_DLG_WS_DEFAULT_SCALING 0
+#endif
 #include "resources/main.rc_mac_dlg"
 #include "swell-menugen.h"
 #include "resources/main.rc_mac_menu"

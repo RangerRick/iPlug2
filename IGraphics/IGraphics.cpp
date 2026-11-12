@@ -80,7 +80,13 @@ void IGraphics::SetScreenScale(float scale)
   
   assert(windowWidth > 0 && windowHeight > 0 && "Window dimensions invalid");
 
-  bool parentResized = GetDelegate()->EditorResizeFromUI(windowWidth, windowHeight, true);
+  bool parentResized = false;
+#ifdef OS_LINUX
+  if (!WindowIsOpen())
+    GetDelegate()->SetEditorSize(windowWidth, windowHeight);
+  else
+#endif
+    parentResized = GetDelegate()->EditorResizeFromUI(windowWidth, windowHeight, true);
   PlatformResize(parentResized);
   ForAllControls(&IControl::OnRescale);
   SetAllControlsDirty();
@@ -91,7 +97,7 @@ void IGraphics::Resize(int w, int h, float scale, bool needsPlatformResize)
 {
   GetDelegate()->ConstrainEditorResize(w, h);
   
-  scale = Clip(scale, mMinScale, mMaxScale);
+  scale = ConstrainDrawScale(scale);
   
   if (w == Width() && h == Height() && scale == GetDrawScale()) return;
 
@@ -107,7 +113,13 @@ void IGraphics::Resize(int w, int h, float scale, bool needsPlatformResize)
   int windowWidth = WindowWidth() * GetPlatformWindowScale();
   int windowHeight = WindowHeight() * GetPlatformWindowScale();
 
-  bool parentResized = GetDelegate()->EditorResizeFromUI(windowWidth, windowHeight, needsPlatformResize);
+  bool parentResized = false;
+#ifdef OS_LINUX
+  if (!WindowIsOpen())
+    GetDelegate()->SetEditorSize(windowWidth, windowHeight);
+  else
+#endif
+    parentResized = GetDelegate()->EditorResizeFromUI(windowWidth, windowHeight, needsPlatformResize);
   PlatformResize(parentResized);
   ForAllControls(&IControl::OnResize);
   SetAllControlsDirty();
